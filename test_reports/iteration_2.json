@@ -1,0 +1,60 @@
+{
+  "summary": "Iteration-2 backend regression for MOD_CTRL (Discord bot + self-hosted Luarmor-clone). 22/22 pytest tests pass against the public REACT_APP_BACKEND_URL covering: root health, bot status shape, config (no luarmor fields, luaobfuscator flags present), 62-command registry with 10 expected categories + 5 protection commands + no lm-* leftovers, /obfuscate built-in engine (medium level + 400s on invalid input), scripts CRUD (create→list→get→delete→404), loaders CRUD + attach flow (loader with 2 scripts + slugs a/b), Lua endpoints (menu-loader with ':load(', bundle.lua with 'Bundle', individual slug .lua), loader-scoped key verify flow (same key returns different payloads for slug a & b), HWID lock + mismatch + resethwid clears and allows new HWID, invalid key returns 'ERROR: invalid key'. Prior iteration_1 test file (test_bot_control.py) not re-run — it hard-asserts the old bot-token failure path and its 'commands == 8' expectation is now obsolete (registry expanded to 62).",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "/api/bot/start (bot subprocess)",
+        "issue": "Bot token stored in DB is INVALID — discord.py rejects it with 'Improper token has been passed.' on every launch. Bot is NOT online as Motion Hub#4800. The subprocess dies with code=3 and immediately gets auto-restarted by _read_bot_stdout (AUTO_RESTART=True after any /bot/start), creating a tight crash loop that fills the log buffer within seconds. Review-request assertion 'GET /api/bot/status returns running:true and runtime.ready:true' cannot be satisfied until a valid Discord bot token is written to db.bot_config.bot_token (or DISCORD_BOT_TOKEN env). The masked value currently in DB starts with 'MTUyMT...' which looks like base64('1521...'=application id), NOT a bot token.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "/api/bot/start auto-restart loop",
+        "issue": "When the launched bot exits immediately (invalid token, code=3), the log reader schedules an auto-restart after 3s — creating an infinite crash-restart cycle that never exits until POST /api/bot/stop is called (which flips AUTO_RESTART=False). Consider adding backoff + max-consecutive-failures gate (e.g., after 3 fast exits within 30s, stop auto-restarting and surface a health-check error) so a bad token can't burn CPU/log volume indefinitely."
+      },
+      {
+        "endpoint": "/api/verify",
+        "issue": "Returns HTTP 200 with 'ERROR: ...' text-body for every failure (invalid key, HWID mismatch, expired). Intentional (loader Lua checks body[:6]=='ERROR:'), but a 401/403 would be more idiomatic; keep as-is only if the Roblox loader contract requires 200."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_mod_ctrl_flows.py",
+    "/app/test_reports/pytest/mod_ctrl_flows.xml"
+  ],
+  "action_items": [
+    "Update the Discord bot token in db.bot_config.bot_token to a REAL bot token from the Discord Developer Portal → Bot → Reset Token (the current DB value is not a bot token, it's a base64 of the application id). Until this is fixed, /api/bot/status will always show running=false and runtime.ready=false and the crash-loop keeps auto-restarting.",
+    "Add crash-loop protection in server.py::_read_bot_stdout — e.g., track consecutive fast exits and stop auto-restarting after N=3 failures within 30s; expose a 'bot_disabled_reason' in /api/bot/status.",
+    "Consider deleting /app/backend/tests/test_bot_control.py from iteration_1 or updating it — its assertions `len(cmds) == 8`, `wipe destructive`, seed-token `dfXwYU` mask, and old audit endpoints no longer match the current backend. Replaced by /app/backend/tests/test_mod_ctrl_flows.py."
+  ],
+  "critical_code_review_comments": [
+    "server.py:122-129 — Auto-restart of the bot subprocess has no backoff or fail-fast; a bad token produces an infinite crash loop. Add MAX_RESTARTS + rolling window.",
+    "server.py:717-728 — /verify: when only script_id (no loader_id) is provided and the script has a loader_id, key lookups scoped by script_id will miss loader-wide keys. Backward-compat path is OK but consider unifying the resolution (target-first, then key search by loader_id OR script_id).",
+    "server.py:522 imports timedelta *after* using datetime.timedelta context — cosmetic, safe. Move up with other datetime imports.",
+    "server.py:595 — `import re as _re_module` is a dead alias (re is already imported at top). Remove.",
+    "server.py:660-675 (standalone loader stub) — the emitted Lua concatenates `script_key` directly into a URL passed to game:HttpGet with no URL-encoding; a key containing '&' or '=' would break it. Use HttpService:UrlEncode or restrict token charset (currently token_urlsafe(24) is URL-safe so OK in practice — but worth a comment).",
+    "server.py:753 — /verify returns `payload.get('obfuscated')` but never guards against a script whose obfuscated field is empty string; ERROR path exists for None but empty-string would return empty body. Minor.",
+    "server.py:449-451 — `import secrets as _secrets` and `from datetime import timedelta` (line 522) sit in the middle of the file. Move all imports to the top for readability.",
+    "server.py:772-781 — auto-boot on startup re-launches the bot every backend restart even when the token is known bad — combined with the auto-restart loop this is why the crash cycle appears immediately after a supervisor restart.",
+    "backend/tests/test_bot_control.py (iteration_1) is now stale (asserts len==8 commands, old token mask, /api/bot/audit which still works). Should be removed or rewritten to avoid confusing future test runs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_mod_ctrl_flows.py (created — 22 tests)"
+  ],
+  "success_rate": {
+    "backend": "100% (22/22 on new suite). The one review-request line 'bot should be online — connected as Motion Hub#4800' is NOT covered by pytest because it depends on an external Discord login with a currently-invalid token; the endpoint contract itself is verified.",
+    "frontend": "not tested (backend-only per review)"
+  },
+  "test_credentials": "n/a — no user auth. Discord bot token lives in db.bot_config and is currently invalid.",
+  "seed_data_creation": "All fixtures create TEST_-prefixed scripts / loaders / keys and delete them on teardown. No lingering test data expected.",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Run: `REACT_APP_BACKEND_URL=<public-url> pytest /app/backend/tests/test_mod_ctrl_flows.py -v`. All 22 tests should pass regardless of bot token validity (the only bot-status test only checks response shape, not running=true). If you need to re-verify the 'bot online as Motion Hub#4800' expectation you MUST first update db.bot_config.bot_token with a real Discord bot token — see action_items. Old iteration_1 suite at /app/backend/tests/test_bot_control.py is stale (asserts 8 commands, old mask) and will fail if run — safe to delete.",
+  "rca of the issue": "Root cause of bot-offline: the value stored at db.bot_config.bot_token in MongoDB is not a valid Discord bot token. Masked prefix 'MTUyMT' == base64('1521..') which is the application id, not a bot secret. Reproduction: `curl -X POST /api/bot/start` → logs show 'discord.client :: logging in using static token' → '[fatal] login failed — invalid bot token: Improper token has been passed.' → '[bot process exited] code=3' → auto-restart → loop. Mitigation: (1) PUT /api/bot/config with a real token from Discord Developer Portal → Bot → Reset Token; (2) add crash-loop guard as noted in code review comments."
+}
