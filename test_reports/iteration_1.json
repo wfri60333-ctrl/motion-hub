@@ -1,0 +1,41 @@
+{
+  "summary": "First-iteration full-stack test of Discord Bot Control dashboard. 9/9 backend pytest tests passed (health, config masking + preservation, start/stop lifecycle, invalid-token log capture with [boot]/[fatal]/'logging in using static token' lines, commands registry with 8 items + destructive /wipe, audit create/list sorted desc). Frontend Playwright coverage passed all acceptance criteria: Overview title, 4 KPIs, live console panel with data-testid, /wipe registry row, Deploy button flow with 'Boot sequence initiated' toast, Config page (appId=1521654504045543578, Save works, invite link href correct), Commands page (8 cards, /wipe ACTIVE badge), Audit page (rows rendered after backend audit POSTs).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_bot_control.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "INFO (not a bug): The bot_token stored in the DB is now a real, valid Discord bot token (masked starts with MTUyMT..., i.e. base64 of the app id 1521...). During backend testing the previous token (dfXwYU...) was still in DB and the invalid-token failure path was successfully validated (logs contain [boot], 'logging in using static token', and [fatal] login failed — invalid bot token: Improper token has been passed.). By the time the UI test ran the token had been updated and the bot successfully logged in as Motion Hub#0000 (1 guild). Both success and failure paths are handled gracefully by the dashboard, matching the review-request expectations.",
+    "Cosmetic: /api/bot/commands returns {commands:[...]} and /api/bot/audit returns {entries:[...]} (envelope objects) while the review request phrasing said 'returns array'. The frontend already unwraps r.commands / r.entries so this is fine; consider documenting the response shape in an OpenAPI schema for clarity."
+  ],
+  "critical_code_review_comments": [
+    "server.py POST /bot/start: env var DISCORD_APP_ID falls back to os.environ.get('DISCORD_APP_ID') if cfg.application_id is empty — acceptable but the fallback masks the case where user cleared it in the dashboard. Consider passing only what's in DB.",
+    "server.py PUT /bot/config: the 'bot_token=empty preserves existing token' behaviour is correct (guarded by .strip() truthiness) — nice.",
+    "discord_bot.py: LoginFailure is caught only in the sync __main__ block via asyncio.run. That works because discord.Client.start raises LoginFailure which propagates out — verified in logs. Good.",
+    "server.py get_config leaks the internal DB 'id' field but never leaks bot_token (explicitly popped). OK.",
+    "Console.jsx polling passes since=cursor which is correct; the ring buffer approach in server.py caps at maxlen=2000 which is sensible.",
+    "No auth on any /api/bot/* endpoint — anyone hitting the public URL can start/stop the bot and view masked config. Acceptable for Phase 1 dashboard but worth flagging for later phases before onboarding real bot tokens."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_bot_control.py (created)"
+  ],
+  "success_rate": {
+    "backend": "100% (9/9)",
+    "frontend": "100% acceptance criteria"
+  },
+  "test_credentials": "n/a — no auth in this app; Discord token is server-side only",
+  "seed_data_creation": "Backend audit test inserted 2 TEST_ audit entries which are visible on the Audit page (not cleaned up, but harmless; can be manually purged from db.audit_log if needed).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend test file at /app/backend/tests/test_bot_control.py can be re-run with `pytest backend/tests/test_bot_control.py -v --junitxml=/app/test_reports/pytest/pytest_results.xml`. Note: test_start_bot_and_invalid_token_flow assumes the configured bot token is INVALID; if the DB is now holding a valid bot token the '[fatal] login failed' assertion will fail — in that case, either reset the token via PUT /api/bot/config to an obviously bad value like 'INVALID' or adjust the assertion. Audit page will still show TEST_ entries from this run.",
+  "rca of the issue": "No blocking issue observed. The single deviation from the review's expectation (bot successfully logging in during UI test) is because the DB-stored token has evolved from the initially-seeded client secret into a real bot token; the invalid-token code path was still exercised & validated in the backend test run and both branches of the dashboard UI (offline->Deploy and online->Halt with live stats) render correctly."
+}
