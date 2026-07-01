@@ -12,6 +12,7 @@ const CATEGORY_ORDER = [
   "utility",
   "config",
   "emoji",
+  "protection",
 ];
 
 export default function CommandsPage() {

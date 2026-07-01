@@ -332,6 +332,12 @@ async def list_commands():
         ("modlog", "Show mod log channel.", "config", False),
         ("autorole", "Set a role auto-added to new members.", "config", False),
         ("welcome", "Set a welcome channel.", "config", False),
+        # script protection (native)
+        ("panel", "Create your script panel with 5 buttons (Redeem/Get Script/Get Role/Reset HWID/Stats).", "protection", False),
+        ("whitelist", "Generate a key for a user and DM it to them.", "protection", False),
+        ("revoke", "Revoke a key (immediate).", "protection", True),
+        ("resethwid", "Force-reset HWID for a key.", "protection", False),
+        ("keyinfo", "Look up details of a key.", "protection", False),
     ]
     return {
         "commands": [
