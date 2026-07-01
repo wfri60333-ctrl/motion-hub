@@ -1,0 +1,44 @@
+{
+  "summary": "Iteration-3 backend-only regression for the HEAD-method fix (BetterStack 405 root-cause). All 17 pytest tests in /app/backend/tests/test_head_support.py pass against the public REACT_APP_BACKEND_URL. THE FIX IS VERIFIED: HEAD /api/ returns 200 (was 405), HEAD /api/health returns 200, GET /api/health is the new dedicated uptime endpoint returning {ok:true}. Regression checked: root JSON body, /bot/status shape, 62 commands present (envelope-wrapped {commands:[...]}), masked bot config (no raw token), scripts/loaders/keys list envelopes, obfuscate (medium level ok:true+output), and the full end-to-end loader flow (create loader -> save 2 scripts -> attach with slugs a/b -> create loader-scoped key -> verify slug=a returns payload -> same key verify slug=b returns payload (loader-wide) -> HWID mismatch returns 'ERROR: ...' with 200), plus Lua stub endpoints (menu .lua, bundle.lua, individual slug .lua) all returning text/plain. Curl-level proof: HEAD /api/ -> HTTP/2 200 content-length:47 (headers-only), HEAD /api/health -> HTTP/2 200 content-length:11. No 405 anywhere.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "/api/bot/status",
+        "issue": "Bot is NOT online — running=false, runtime.ready=false — because the Discord bot token stored in db.bot_config.bot_token is still invalid (carried over from iteration_2 unresolved item). The review-request assertion 'Bot still online as Motion Hub#4800 with running:true, runtime.ready:true' is NOT satisfied. This is UNRELATED to the HEAD-method fix, but flagged so the main agent doesn't miss it: user must write a real bot token into DB (or set DISCORD_BOT_TOKEN env) via the /api/bot/config PUT flow.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_head_support.py",
+    "/app/test_reports/pytest/head_support.xml",
+    "/app/backend/tests/test_mod_ctrl_flows.py"
+  ],
+  "action_items": [
+    "HEAD-method fix on /api/ and /api/health is verified and production-ready — safe to redeploy to Render.com; BetterStack should stop reporting 405.",
+    "PRE-EXISTING (from iteration_2, still open): Replace the invalid Discord bot token in db.bot_config.bot_token with a real token from Discord Developer Portal so /api/bot/status shows running:true. Currently the subprocess crash-loops with 'Improper token has been passed.' and AUTO_RESTART keeps re-spawning it.",
+    "PRE-EXISTING (from iteration_2, still open): Add backoff + max-consecutive-failures gate around _read_bot_stdout auto-restart to prevent the tight crash-restart cycle when the token is invalid.",
+    "Optional: delete or rewrite /app/backend/tests/test_bot_control.py (iteration_1 leftover) — its 'len(cmds)==8', old-token mask, and destructive-wipe assertions no longer match the current backend and could confuse future test runs."
+  ],
+  "critical_code_review_comments": [
+    "server.py:138-146 — The HEAD fix uses @api_router.api_route(path, methods=['GET','HEAD']) which is the idiomatic FastAPI way to accept both. Correct implementation. Note: only /api/ and /api/health explicitly accept HEAD; every other endpoint declared via @api_router.get(...) will still return 405 on HEAD. That's fine for BetterStack (it will only poll /api/health) but if any other uptime probe hits /api/bot/status with HEAD it will still 405. Consider a global middleware that auto-maps GET->HEAD for read-only endpoints if broader HEAD support is desired.",
+    "server.py:143-146 — /api/health always returns 200 without checking DB or bot subprocess health. It is a pure liveness probe, not a readiness probe. That's acceptable for uptime-monitor use, but document it so someone doesn't accidentally use it to gate deploys.",
+    "server.py bot auto-restart loop (from iteration_2, still unresolved) — invalid token produces infinite crash cycle."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_head_support.py (created — 17 tests: 4 HEAD-fix + 7 regression + 6 end-to-end loader flow)"
+  ],
+  "success_rate": {"backend": "100% (17/17)", "frontend": "n/a (skipped per request)"},
+  "test_credentials": "N/A — no auth on backend endpoints",
+  "seed_data_creation": "Created 1 TEST_loader_<ts>, 2 TEST_script<A|B>_<ts>, and 1 loader-scoped test key during the loader flow test. Not cleaned up (backend has no bulk-delete-by-prefix). Safe to ignore.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "The HEAD-method 405 bug is FIXED and fully covered by /app/backend/tests/test_head_support.py::TestHeadFix (4 tests). Run with: REACT_APP_BACKEND_URL=<url> python -m pytest backend/tests/test_head_support.py -v. Bot subprocess is STILL not online (pre-existing invalid-token issue from iter_2) — do not confuse this with a HEAD-fix regression. If you need a broader regression, /app/backend/tests/test_mod_ctrl_flows.py (22 tests from iter_2) is still the canonical suite.",
+  "rca_of_the_issue": "ROOT CAUSE: FastAPI's @api_router.get('/') decorator only registers the GET method. When BetterStack's uptime monitor issued a HEAD /api/ request, Starlette's router matched the path but not the method, so it correctly returned 405 Method Not Allowed. FIX: changed the decorator to @api_router.api_route('/', methods=['GET','HEAD']) which registers both methods on the same handler; FastAPI/Starlette automatically strips the body for HEAD responses. Additionally, a dedicated @api_router.api_route('/health', methods=['GET','HEAD']) endpoint was added returning {ok:true} for a clean uptime probe target. REPRO (before fix): curl -sI <url>/api/ -> HTTP/2 405. VERIFICATION (after fix): curl -sI <url>/api/ -> HTTP/2 200; curl -sI <url>/api/health -> HTTP/2 200; both with empty body but proper content-length header. MITIGATION: none needed — fix is minimal, backward compatible, and covered by 4 new tests."
+}

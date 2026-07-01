@@ -135,9 +135,15 @@ def _is_bot_running() -> bool:
     return BOT_PROCESS is not None and BOT_PROCESS.poll() is None
 
 
-@api_router.get("/")
+@api_router.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"service": "discord-bot-control", "status": "ok"}
+
+
+@api_router.api_route("/health", methods=["GET", "HEAD"])
+async def health():
+    """Dedicated uptime-monitor endpoint. Accepts GET or HEAD."""
+    return {"ok": True}
 
 
 @api_router.get("/bot/config")
