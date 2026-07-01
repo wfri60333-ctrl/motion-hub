@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: mod-ctrl-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DB_NAME
+        value: modctrl
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: DISCORD_APP_ID
+        value: "1521654504045543578"
+      # Fill these in Render dashboard AFTER deploy (they contain secrets)
+      - key: MONGO_URL
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: LUAOBFUSCATOR_API_KEY
+        sync: false
+    healthCheckPath: /api/
