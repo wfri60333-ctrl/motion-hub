@@ -14,6 +14,7 @@ from typing import List, Optional
 from collections import deque
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
@@ -764,6 +765,195 @@ async def verify_key(script_id: Optional[str] = None, loader_id: Optional[str] =
 
 
 app.include_router(api_router)
+
+
+# ============= DISCORD OAUTH2 VERIFY / RESTORE =============
+import httpx as _httpx_v
+
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_CLIENT_ID = os.environ.get("DISCORD_APP_ID", "").strip()
+DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET", "").strip()
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+
+
+class VerifySetupPayload(BaseModel):
+    guild_id: str
+    verified_role_id: str
+    logs_channel_id: Optional[str] = None
+
+
+@api_router.get("/verify/config/{guild_id}")
+async def get_verify_cfg(guild_id: str):
+    doc = await db.verify_config.find_one({"guild_id": guild_id}, {"_id": 0})
+    return doc or {}
+
+
+@api_router.post("/verify/config")
+async def set_verify_cfg(payload: VerifySetupPayload):
+    await db.verify_config.update_one(
+        {"guild_id": payload.guild_id},
+        {"$set": payload.model_dump()},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@api_router.get("/verify/start")
+async def verify_start(guild_id: str):
+    """Bot's Verify button redirects here → we redirect to Discord's OAuth page."""
+    if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+        raise HTTPException(500, "OAuth not configured (missing CLIENT_SECRET env var)")
+    base = os.environ.get("PUBLIC_API_URL") or "http://localhost:8001"
+    redirect_uri = f"{base}/api/verify/callback"
+    scope = "identify+guilds.join"
+    from urllib.parse import quote
+    state = f"{guild_id}:{_secrets.token_urlsafe(12)}"
+    url = (f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}"
+           f"&redirect_uri={quote(redirect_uri)}&response_type=code&scope={scope}&state={state}")
+    return {"authorize_url": url}
+
+
+@api_router.get("/verify/callback", response_class=HTMLResponse)
+async def verify_callback(code: str, state: str, request: Request):
+    """Discord redirects here after user authorizes. Exchange code, add member, grant role, log."""
+    if not DISCORD_CLIENT_SECRET or not DISCORD_BOT_TOKEN:
+        return HTMLResponse("<h1>OAuth not configured on backend</h1>", status_code=500)
+    try:
+        guild_id = state.split(":", 1)[0]
+    except Exception:
+        return HTMLResponse("<h1>Invalid state</h1>", status_code=400)
+
+    cfg = await db.verify_config.find_one({"guild_id": guild_id}, {"_id": 0})
+    if not cfg:
+        return HTMLResponse("<h1>Server not configured for verification</h1>", status_code=400)
+
+    base = os.environ.get("PUBLIC_API_URL") or "http://localhost:8001"
+    redirect_uri = f"{base}/api/verify/callback"
+
+    async with _httpx_v.AsyncClient(timeout=15) as h:
+        # Exchange code for token
+        tok = await h.post(
+            f"{DISCORD_API}/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if tok.status_code >= 400:
+            return HTMLResponse(f"<h1>Token exchange failed</h1><pre>{tok.text}</pre>", status_code=400)
+        tok_data = tok.json()
+        access_token = tok_data["access_token"]
+
+        # Get user info
+        me = await h.get(f"{DISCORD_API}/users/@me",
+                         headers={"Authorization": f"Bearer {access_token}"})
+        me.raise_for_status()
+        user = me.json()
+
+        # Add member to guild
+        add = await h.put(
+            f"{DISCORD_API}/guilds/{guild_id}/members/{user['id']}",
+            json={"access_token": access_token, "roles": [cfg["verified_role_id"]]},
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                     "Content-Type": "application/json"},
+        )
+        # 201 = added, 204 = already a member
+        added_status = add.status_code
+
+        # If already a member (204), grant the role explicitly
+        if added_status == 204:
+            await h.put(
+                f"{DISCORD_API}/guilds/{guild_id}/members/{user['id']}/roles/{cfg['verified_role_id']}",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            )
+
+        # Log details to logs channel
+        ip = (request.headers.get("x-forwarded-for", "") or
+              request.client.host if request.client else "unknown")
+        ip = ip.split(",")[0].strip()
+        ua = request.headers.get("user-agent", "unknown")
+
+        # Save to DB (for /restore later)
+        await db.verified_users.update_one(
+            {"guild_id": guild_id, "user_id": user["id"]},
+            {"$set": {
+                "guild_id": guild_id,
+                "user_id": user["id"],
+                "username": f"{user.get('username')}#{user.get('discriminator','0')}"
+                            if user.get('discriminator', '0') != '0' else user.get('username'),
+                "access_token": access_token,
+                "refresh_token": tok_data.get("refresh_token"),
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+                "ip": ip,
+                "user_agent": ua,
+            }},
+            upsert=True,
+        )
+
+        # Post to logs channel if configured
+        if cfg.get("logs_channel_id"):
+            embed = {
+                "title": "✅ Member Verified",
+                "color": 0x34C759,
+                "fields": [
+                    {"name": "User", "value": f"<@{user['id']}> `{user['id']}`", "inline": False},
+                    {"name": "IP", "value": f"`{ip}`", "inline": True},
+                    {"name": "User-Agent", "value": f"`{ua[:200]}`", "inline": False},
+                ],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                await h.post(
+                    f"{DISCORD_API}/channels/{cfg['logs_channel_id']}/messages",
+                    json={"embeds": [embed]},
+                    headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+                )
+            except Exception:
+                pass
+
+    return HTMLResponse(f"""
+<!doctype html><html><head><meta charset="utf-8"><title>Verified</title>
+<style>body{{background:#050505;color:#fff;font-family:system-ui;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0;text-align:center}}
+h1{{font-size:2rem;color:#34C759}}p{{color:#888;max-width:400px}}
+</style></head><body><div>
+<h1>✓ You're verified</h1>
+<p>Welcome, {user.get('username','friend')}! You can close this tab and return to Discord.</p>
+</div></body></html>""")
+
+
+@api_router.post("/verify/restore/{guild_id}")
+async def restore_members(guild_id: str, role_id: Optional[str] = None):
+    """Force-re-add all previously verified users to the same guild. Rate-limited by Discord."""
+    users = await db.verified_users.find({"guild_id": guild_id}, {"_id": 0}).to_list(10000)
+    if not users:
+        return {"ok": True, "restored": 0, "message": "no verified users to restore"}
+    cfg = await db.verify_config.find_one({"guild_id": guild_id}, {"_id": 0}) or {}
+    grant_role = role_id or cfg.get("verified_role_id")
+    added = 0
+    failed = 0
+    async with _httpx_v.AsyncClient(timeout=15) as h:
+        for u in users:
+            try:
+                body = {"access_token": u["access_token"]}
+                if grant_role: body["roles"] = [grant_role]
+                r = await h.put(
+                    f"{DISCORD_API}/guilds/{guild_id}/members/{u['user_id']}",
+                    json=body,
+                    headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                             "Content-Type": "application/json"},
+                )
+                if r.status_code in (201, 204):
+                    added += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+    return {"ok": True, "restored": added, "failed": failed, "total": len(users)}
 
 app.add_middleware(
     CORSMiddleware,
