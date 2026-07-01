@@ -212,7 +212,9 @@ async def bot_start():
     env["DISCORD_BOT_TOKEN"] = token
     env["DISCORD_APP_ID"] = cfg.get("application_id", "") or env.get("DISCORD_APP_ID", "")
     env["ALLOWED_ROLE_IDS"] = ",".join(cfg.get("allowed_role_ids") or [])
-    env["BOT_API_URL"] = os.environ.get("BOT_API_URL", "http://localhost:8001")
+    # BOT_API_URL: use the port the backend actually listens on (Render sets $PORT)
+    _port = os.environ.get("PORT", "8001")
+    env["BOT_API_URL"] = os.environ.get("BOT_API_URL", f"http://localhost:{_port}")
     env["PYTHONUNBUFFERED"] = "1"
 
     bot_script = str(ROOT_DIR / "discord_bot.py")
