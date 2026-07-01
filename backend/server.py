@@ -63,6 +63,12 @@ class BotConfigUpdate(BaseModel):
     application_id: Optional[str] = None
     allowed_role_ids: Optional[List[str]] = None
     luaobfuscator_api_key: Optional[str] = None
+    # Per-command-category role gate: {"moderation": ["roleId", ...], "protection": [...], ...}
+    command_role_perms: Optional[dict] = None
+    # HWID user-facing reset cooldown (in hours). Admin resets always bypass.
+    hwid_reset_cooldown_hours: Optional[int] = None
+    # Auto-blacklist a key after N consecutive HWID mismatches. 0 disables.
+    hwid_mismatch_lockout: Optional[int] = None
 
 
 class AuditCreate(BaseModel):
@@ -89,10 +95,27 @@ async def get_or_create_config() -> dict:
             "bot_token": os.environ.get("DISCORD_BOT_TOKEN", ""),
             "application_id": os.environ.get("DISCORD_APP_ID", ""),
             "allowed_role_ids": [],
+            "command_role_perms": {},
+            "hwid_reset_cooldown_hours": 24,
+            "hwid_mismatch_lockout": 5,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.bot_config.insert_one(doc)
         doc.pop("_id", None)
+    # Backfill new fields for older configs
+    changed = False
+    if "command_role_perms" not in doc:
+        doc["command_role_perms"] = {}; changed = True
+    if "hwid_reset_cooldown_hours" not in doc:
+        doc["hwid_reset_cooldown_hours"] = 24; changed = True
+    if "hwid_mismatch_lockout" not in doc:
+        doc["hwid_mismatch_lockout"] = 5; changed = True
+    if changed:
+        await db.bot_config.update_one({"id": doc["id"]}, {"$set": {
+            "command_role_perms": doc["command_role_perms"],
+            "hwid_reset_cooldown_hours": doc["hwid_reset_cooldown_hours"],
+            "hwid_mismatch_lockout": doc["hwid_mismatch_lockout"],
+        }})
     return doc
 
 
@@ -177,6 +200,18 @@ async def update_config(payload: BotConfigUpdate):
         updates["allowed_role_ids"] = [r.strip() for r in payload.allowed_role_ids if r.strip()]
     if payload.luaobfuscator_api_key is not None:
         updates["luaobfuscator_api_key"] = payload.luaobfuscator_api_key.strip()
+    if payload.command_role_perms is not None:
+        # Sanitize: keys are command categories, values are lists of role-id strings
+        cleaned = {}
+        for cat, ids in payload.command_role_perms.items():
+            if not isinstance(ids, list):
+                continue
+            cleaned[str(cat)] = [str(r).strip() for r in ids if str(r).strip()]
+        updates["command_role_perms"] = cleaned
+    if payload.hwid_reset_cooldown_hours is not None:
+        updates["hwid_reset_cooldown_hours"] = max(0, int(payload.hwid_reset_cooldown_hours))
+    if payload.hwid_mismatch_lockout is not None:
+        updates["hwid_mismatch_lockout"] = max(0, int(payload.hwid_mismatch_lockout))
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.bot_config.update_one({"id": current["id"]}, {"$set": updates})
     return {"ok": True}
@@ -348,9 +383,12 @@ async def list_commands():
         ("panel", "Create your script panel with 5 buttons (Redeem/Get Script/Get Role/Reset HWID/Stats).", "protection", False),
         ("whitelist", "Generate a key for a user and DM it to them.", "protection", False),
         ("revoke", "Revoke a key (immediate).", "protection", True),
-        ("resethwid", "Force-reset HWID for a key.", "protection", False),
+        ("resethwid", "Force-reset HWID for a key (admin, bypasses cooldown, unlocks).", "protection", False),
+        ("forceresethwid", "Alias of /resethwid — force-reset a user's HWID.", "protection", False),
+        ("unlockkey", "Unlock a key that auto-locked after HWID mismatches.", "protection", False),
         ("keyinfo", "Look up details of a key.", "protection", False),
         ("obfuscate", "Obfuscate a .lua file attachment (light/medium/heavy).", "protection", False),
+        ("perms", "View or set per-category role permissions.", "config", False),
     ]
     return {
         "commands": [
@@ -524,10 +562,97 @@ async def revoke_key(key_id: str):
     return {"ok": True, "deleted": r.deleted_count}
 
 
+class UserResetRequest(BaseModel):
+    key: str
+
+
+@api_router.post("/keys/user/resethwid")
+async def user_reset_hwid(payload: UserResetRequest):
+    """User-facing reset (used by the Discord panel button).
+    Enforces the configured cooldown (default 24h). Logs the event either way.
+    """
+    row = await db.wl_keys.find_one({"key": payload.key}, {"_id": 0})
+    if not row:
+        raise HTTPException(status_code=404, detail="Invalid key")
+    if row.get("status") == "locked":
+        raise HTTPException(status_code=403, detail="Key is locked. Ask an admin to reset it.")
+    cfg = await get_or_create_config()
+    cooldown_h = int(cfg.get("hwid_reset_cooldown_hours") or 24)
+    last_reset = row.get("hwid_reset_at")
+    if last_reset and cooldown_h > 0:
+        try:
+            last_dt = datetime.fromisoformat(last_reset)
+            elapsed = datetime.now(timezone.utc) - last_dt
+            remaining = timedelta(hours=cooldown_h) - elapsed
+            if remaining.total_seconds() > 0:
+                await db.hwid_events.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "key_id": row["id"], "key": row["key"],
+                    "event": "reset_blocked_cooldown",
+                    "actor": "user",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "cooldown_remaining_seconds": int(remaining.total_seconds()),
+                })
+                total = int(remaining.total_seconds())
+                h, rem = divmod(total, 3600); m, _ = divmod(rem, 60)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Cooldown active. Try again in {h}h {m}m.",
+                )
+        except ValueError:
+            pass
+    now = datetime.now(timezone.utc).isoformat()
+    await db.wl_keys.update_one(
+        {"key": payload.key},
+        {"$set": {"hwid": None, "hwid_reset_at": now, "hwid_mismatch_count": 0}},
+    )
+    await db.hwid_events.insert_one({
+        "id": str(uuid.uuid4()),
+        "key_id": row["id"], "key": row["key"],
+        "event": "user_reset",
+        "actor": row.get("discord_id") or "user",
+        "ts": now,
+    })
+    return {"ok": True}
+
+
 @api_router.post("/keys/{key_id}/resethwid")
-async def reset_key_hwid(key_id: str):
-    r = await db.wl_keys.update_one({"id": key_id}, {"$set": {"hwid": None}})
+async def reset_key_hwid(key_id: str, actor: Optional[str] = "dashboard-admin"):
+    """Admin/dashboard reset. Bypasses cooldown, wipes mismatch counter, logs event."""
+    row = await db.wl_keys.find_one({"id": key_id}, {"_id": 0})
+    if not row:
+        return {"ok": False, "modified": 0, "error": "key not found"}
+    now = datetime.now(timezone.utc).isoformat()
+    r = await db.wl_keys.update_one(
+        {"id": key_id},
+        {"$set": {
+            "hwid": None,
+            "hwid_reset_at": now,
+            "hwid_mismatch_count": 0,
+            "status": "active" if row.get("status") == "locked" else row.get("status", "active"),
+        }},
+    )
+    await db.hwid_events.insert_one({
+        "id": str(uuid.uuid4()),
+        "key_id": key_id,
+        "key": row.get("key"),
+        "event": "admin_reset",
+        "actor": actor,
+        "ts": now,
+    })
     return {"ok": True, "modified": r.modified_count}
+
+
+@api_router.get("/keys/{key_id}/history")
+async def key_hwid_history(key_id: str, limit: int = 100):
+    rows = await db.hwid_events.find({"key_id": key_id}, {"_id": 0}).sort("ts", -1).to_list(limit)
+    return {"events": rows}
+
+
+@api_router.get("/hwid/events")
+async def all_hwid_events(limit: int = 200):
+    rows = await db.hwid_events.find({}, {"_id": 0}).sort("ts", -1).to_list(limit)
+    return {"events": rows}
 
 
 # --- Loader + verify (the actual execution flow) ---
@@ -759,51 +884,93 @@ return L
 
 
 @api_router.get("/verify", response_class=PlainTextResponse)
-async def verify_key(script_id: Optional[str] = None, loader_id: Optional[str] = None,
+async def verify_key(request: Request, script_id: Optional[str] = None, loader_id: Optional[str] = None,
                      slug: Optional[str] = None, key: str = "", hwid: str = ""):
     """Called by the loader. Verifies key + HWID.
     Accepts either script_id (standalone) or loader_id + optional slug (loader mode).
+    Every attempt is logged to hwid_events for the dashboard audit log.
     """
+    # Best-effort client IP (works behind Render/Cloudflare proxies)
+    fwd = request.headers.get("x-forwarded-for", "") or ""
+    client_ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "unknown")
+
+    async def _log_event(evt: str, row: Optional[dict] = None, extra: Optional[dict] = None):
+        entry = {
+            "id": str(uuid.uuid4()),
+            "event": evt,
+            "key": key or None,
+            "key_id": (row or {}).get("id"),
+            "hwid": hwid or None,
+            "ip": client_ip,
+            "script_id": script_id, "loader_id": loader_id, "slug": slug,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            entry.update(extra)
+        try:
+            await db.hwid_events.insert_one(entry)
+        except Exception:
+            pass
+
     if not key:
+        await _log_event("verify_no_key")
         return "ERROR: missing key"
     # Resolve target script
     target = None
     if loader_id:
         if slug:
             target = await db.scripts.find_one({"loader_id": loader_id, "slug": slug}, {"_id": 0})
-        # Also allow key lookup by loader_id (any key linked to this loader)
         row = await db.wl_keys.find_one({"key": key, "loader_id": loader_id}, {"_id": 0})
-        if not row:
-            # backward-compat: also check keys with just script_id if slug script has it
-            if target:
-                row = await db.wl_keys.find_one({"key": key, "script_id": target["id"]}, {"_id": 0})
+        if not row and target:
+            row = await db.wl_keys.find_one({"key": key, "script_id": target["id"]}, {"_id": 0})
     else:
         target = await db.scripts.find_one({"id": script_id}, {"_id": 0}) if script_id else None
         row = await db.wl_keys.find_one({"key": key, "script_id": script_id}, {"_id": 0}) if script_id else None
     if not row:
+        await _log_event("verify_invalid_key")
         return "ERROR: invalid key"
     if row.get("status") != "active":
-        return "ERROR: key is not active"
+        await _log_event("verify_key_not_active", row, {"status": row.get("status")})
+        return f"ERROR: key is {row.get('status', 'not active')}"
     exp = row.get("expires_at")
     if exp:
         try:
             if datetime.fromisoformat(exp) < datetime.now(timezone.utc):
+                await _log_event("verify_expired", row)
                 return "ERROR: key expired"
         except Exception:
             pass
     stored_hwid = row.get("hwid")
     if stored_hwid and hwid and stored_hwid != hwid:
+        # Increment mismatch counter; auto-lockout after N
+        cfg = await get_or_create_config()
+        lockout = int(cfg.get("hwid_mismatch_lockout") or 0)
+        new_count = int(row.get("hwid_mismatch_count") or 0) + 1
+        update = {"hwid_mismatch_count": new_count,
+                  "last_mismatch_at": datetime.now(timezone.utc).isoformat(),
+                  "last_mismatch_ip": client_ip,
+                  "last_mismatch_hwid": hwid}
+        if lockout > 0 and new_count >= lockout:
+            update["status"] = "locked"
+        await db.wl_keys.update_one({"key": key}, {"$set": update})
+        await _log_event("hwid_mismatch", row, {"mismatch_count": new_count, "locked": update.get("status") == "locked"})
+        if update.get("status") == "locked":
+            return "ERROR: key is locked (too many HWID mismatches). Ask admin."
         return "ERROR: HWID mismatch. Ask admin to reset."
     if not stored_hwid and hwid:
-        await db.wl_keys.update_one({"key": key}, {"$set": {"hwid": hwid}})
+        await db.wl_keys.update_one({"key": key}, {"$set": {"hwid": hwid, "hwid_bound_at": datetime.now(timezone.utc).isoformat()}})
+        await _log_event("hwid_bound", row)
     await db.wl_keys.update_one(
         {"key": key},
         {"$inc": {"executions": 1},
-         "$set": {"last_used": datetime.now(timezone.utc).isoformat()}},
+         "$set": {"last_used": datetime.now(timezone.utc).isoformat(),
+                  "last_ip": client_ip}},
     )
     if not target:
+        await _log_event("verify_no_target", row)
         return "ERROR: target script not found"
     payload = await db.scripts.find_one({"id": target["id"]}, {"_id": 0})
+    await _log_event("verify_ok", row)
     return payload.get("obfuscated") or "ERROR: no payload"
 
 

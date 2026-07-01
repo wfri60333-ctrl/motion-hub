@@ -98,11 +98,73 @@ async def _push_runtime():
         pass
 
 
-def _is_authorized(member: discord.Member) -> bool:
+def _is_authorized(member: discord.Member, category: Optional[str] = None) -> bool:
+    """Global authorization: Administrator OR member of any ALLOWED_ROLE_IDS.
+    If category is provided AND per-category perms are configured, the member
+    must ALSO hold one of the roles configured for that category.
+    """
     if member.guild_permissions.administrator:
         return True
     role_ids = {r.id for r in getattr(member, "roles", [])}
-    return any(rid in role_ids for rid in ALLOWED_ROLE_IDS)
+    # Global allow-list first
+    if not any(rid in role_ids for rid in ALLOWED_ROLE_IDS):
+        return False
+    # Then optional per-category gate
+    if category:
+        cat_roles = CATEGORY_ROLE_PERMS.get(category) or []
+        if cat_roles:  # if configured, member must be in it
+            return any(int(r) in role_ids for r in cat_roles if str(r).isdigit())
+    return True
+
+
+async def _refresh_perms_from_backend():
+    """Pull latest per-category role gate from the backend/db so dashboard edits take effect."""
+    global CATEGORY_ROLE_PERMS
+    try:
+        doc = await db.bot_config.find_one({}, {"_id": 0, "command_role_perms": 1})
+        CATEGORY_ROLE_PERMS = (doc or {}).get("command_role_perms") or {}
+    except Exception as e:
+        _log(f"[perms] refresh failed: {e}")
+
+
+# Loaded at startup + refreshed periodically. Shape: {"moderation": ["roleId", ...], ...}
+CATEGORY_ROLE_PERMS: Dict[str, list] = {}
+
+
+# Which slash-command name belongs to which category (mirrors server.py /bot/commands list)
+COMMAND_CATEGORY: Dict[str, str] = {
+    # moderation
+    "wipe": "moderation", "nuke": "moderation", "ban": "moderation", "unban": "moderation",
+    "kick": "moderation", "timeout": "moderation", "untimeout": "moderation",
+    "warn": "moderation", "warnings": "moderation", "clearwarnings": "moderation",
+    "purge": "moderation", "snipe": "moderation", "banlist": "moderation",
+    # channel
+    "lock": "channel", "unlock": "channel", "hide": "channel", "show": "channel",
+    "slowmode": "channel", "rename": "channel", "topic": "channel", "nsfw": "channel",
+    "clone": "channel", "createchannel": "channel", "deletechannel": "channel", "channelinfo": "channel",
+    # role
+    "addrole": "role", "removerole": "role", "createrole": "role", "deleterole": "role",
+    "rolecolor": "role", "roleinfo": "role", "rolelist": "role",
+    # nickname
+    "nick": "nickname", "resetnick": "nickname",
+    # voice
+    "vmute": "voice", "vunmute": "voice", "deafen": "voice", "undeafen": "voice",
+    "disconnect": "voice", "move": "voice",
+    # info
+    "ping": "info", "uptime": "info", "serverinfo": "info", "userinfo": "info",
+    "avatar": "info", "membercount": "info", "invites": "info",
+    # utility
+    "say": "utility", "embed": "utility", "poll": "utility", "remind": "utility",
+    # emoji
+    "addemoji": "emoji", "deleteemoji": "emoji",
+    # config
+    "setmodlog": "config", "modlog": "config", "autorole": "config", "welcome": "config",
+    "perms": "config",
+    # protection (script/whitelist)
+    "panel": "protection", "whitelist": "protection", "revoke": "protection",
+    "resethwid": "protection", "forceresethwid": "protection", "keyinfo": "protection",
+    "obfuscate": "protection", "unlockkey": "protection",
+}
 
 
 async def _get_modlog_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -192,6 +254,9 @@ async def on_ready():
     _log(f"[ready] connected to {len(client.guilds)} guild(s)")
     for g in client.guilds:
         _log(f"  - {g.name} ({g.id}) members={g.member_count}")
+    # Load per-category role perms from Mongo
+    await _refresh_perms_from_backend()
+    _log(f"[perms] loaded per-category role gate: {CATEGORY_ROLE_PERMS}")
     # Register persistent script-panel view (buttons survive restarts)
     try:
         client.add_view(ScriptPanel())
@@ -251,7 +316,9 @@ def needs_auth():
         m = interaction.user
         if not isinstance(m, discord.Member):
             m = interaction.guild.get_member(m.id)
-        if not m or not _is_authorized(m):
+        cmd_name = interaction.command.name if interaction.command else None
+        category = COMMAND_CATEGORY.get(cmd_name) if cmd_name else None
+        if not m or not _is_authorized(m, category):
             raise AuthFail()
         return True
     return app_commands.check(predicate)
@@ -1207,13 +1274,62 @@ class ResetHwidModal(discord.ui.Modal, title="Reset HWID"):
 
     async def on_submit(self, interaction: discord.Interaction):
         key_str = str(self.key_input.value).strip()
-        row = await _find_key(key_str)
-        if not row:
-            await interaction.response.send_message(_err("Invalid key."), ephemeral=True)
+        # Hit the backend which enforces the configured cooldown + logs the event
+        try:
+            async with httpx.AsyncClient(timeout=6) as http:
+                r = await http.post(f"{BOT_API_URL}/api/keys/user/resethwid",
+                                    json={"key": key_str})
+        except Exception as e:
+            # Backend unreachable → fall back to direct Mongo write WITH cooldown check
+            row = await _find_key(key_str)
+            if not row:
+                await interaction.response.send_message(_err("Invalid key."), ephemeral=True); return
+            if row.get("status") == "locked":
+                await interaction.response.send_message(
+                    _err("Key is locked. Ask an admin to reset it."), ephemeral=True); return
+            cfg = await db.bot_config.find_one({}, {"_id": 0}) or {}
+            cooldown_h = int(cfg.get("hwid_reset_cooldown_hours") or 24)
+            last_reset = row.get("hwid_reset_at")
+            if last_reset and cooldown_h > 0:
+                try:
+                    elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_reset)
+                    remaining = timedelta(hours=cooldown_h) - elapsed
+                    if remaining.total_seconds() > 0:
+                        total = int(remaining.total_seconds())
+                        h, rem = divmod(total, 3600); m, _ = divmod(rem, 60)
+                        await interaction.response.send_message(
+                            _err(f"Cooldown active. Try again in {h}h {m}m."), ephemeral=True); return
+                except Exception:
+                    pass
+            now = datetime.now(timezone.utc).isoformat()
+            await db.wl_keys.update_one(
+                {"key": key_str},
+                {"$set": {"hwid": None, "hwid_reset_at": now, "hwid_mismatch_count": 0}},
+            )
+            await interaction.response.send_message(
+                _ok("HWID reset. Re-run the script to bind fresh."), ephemeral=True)
             return
-        await db.wl_keys.update_one({"key": key_str}, {"$set": {"hwid": None}})
-        await interaction.response.send_message(
-            _ok("HWID reset. Re-run the script to bind fresh."), ephemeral=True)
+        # Success/failure path when backend was reached
+        if r.status_code == 200:
+            await interaction.response.send_message(
+                _ok("HWID reset. Re-run the script to bind fresh."), ephemeral=True)
+        elif r.status_code == 404:
+            await interaction.response.send_message(_err("Invalid key."), ephemeral=True)
+        elif r.status_code == 429:
+            try:
+                detail = r.json().get("detail", "Cooldown active. Try again later.")
+            except Exception:
+                detail = "Cooldown active. Try again later."
+            await interaction.response.send_message(_err(detail), ephemeral=True)
+        elif r.status_code == 403:
+            try:
+                detail = r.json().get("detail", "Key is locked.")
+            except Exception:
+                detail = "Key is locked."
+            await interaction.response.send_message(_err(detail), ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                _err(f"Reset failed ({r.status_code})."), ephemeral=True)
 
 
 class ScriptPanel(discord.ui.View):
@@ -1302,11 +1418,28 @@ class ScriptPanel(discord.ui.View):
             await interaction.response.send_message(
                 _err("No key linked to your Discord."), ephemeral=True)
             return
+        # Cooldown calc
+        bot_cfg = await db.bot_config.find_one({}, {"_id": 0}) or {}
+        cooldown_h = int(bot_cfg.get("hwid_reset_cooldown_hours") or 24)
+        cd_line = "ready"
+        last_reset = row.get("hwid_reset_at")
+        if last_reset and cooldown_h > 0:
+            try:
+                elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_reset)
+                remaining = timedelta(hours=cooldown_h) - elapsed
+                if remaining.total_seconds() > 0:
+                    total = int(remaining.total_seconds())
+                    h, rem = divmod(total, 3600); m, _ = divmod(rem, 60)
+                    cd_line = f"{h}h {m}m left"
+            except Exception:
+                pass
         e = discord.Embed(title="📊 Your Stats", color=0x007AFF)
         e.add_field(name="Key", value=f"||`{row.get('key', '?')}`||", inline=False)
         e.add_field(name="Status", value=str(row.get("status", "active")))
         e.add_field(name="Executions", value=str(row.get("executions", 0)))
-        e.add_field(name="HWID", value="locked" if row.get("hwid") else "unbound")
+        e.add_field(name="HWID", value="🔒 locked" if row.get("hwid") else "🔓 unbound")
+        e.add_field(name="Reset cooldown", value=cd_line)
+        e.add_field(name="Mismatches", value=str(row.get("hwid_mismatch_count", 0)))
         e.add_field(name="Expires", value=str(row.get("expires_at") or "never"))
         e.add_field(name="Last used", value=str(row.get("last_used") or "never"))
         e.add_field(name="Note", value=str(row.get("note") or "—"), inline=False)
@@ -1424,15 +1557,107 @@ async def revoke_cmd(interaction: discord.Interaction, user_key: str):
         await _reply(interaction, _err("Key not found."))
 
 
-@tree.command(name="resethwid", description="Force-reset HWID for a key.")
+@tree.command(name="resethwid", description="Force-reset HWID for a key (admin — bypasses cooldown & unlocks).")
+@app_commands.describe(user_key="The whitelist key to reset")
 @guild_only()
 @needs_auth()
 async def resethwid_cmd(interaction: discord.Interaction, user_key: str):
-    r = await db.wl_keys.update_one({"key": user_key}, {"$set": {"hwid": None}})
+    row = await db.wl_keys.find_one({"key": user_key}, {"_id": 0})
+    if not row:
+        await _reply(interaction, _err("Key not found."))
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    await db.wl_keys.update_one(
+        {"key": user_key},
+        {"$set": {"hwid": None, "hwid_reset_at": now,
+                  "hwid_mismatch_count": 0, "status": "active"}},
+    )
+    try:
+        await db.hwid_events.insert_one({
+            "id": _secrets_lib.token_hex(16),
+            "key_id": row.get("id"), "key": user_key,
+            "event": "admin_force_reset",
+            "actor": str(interaction.user.id),
+            "actor_name": str(interaction.user),
+            "ts": now,
+        })
+    except Exception:
+        pass
+    await _reply(interaction, _ok(f"Force-reset HWID for key. Cooldown cleared, mismatch counter zeroed, key unlocked."))
+
+
+@tree.command(name="forceresethwid", description="Alias of /resethwid — force-reset a user's HWID and unlock.")
+@app_commands.describe(user_key="The whitelist key to reset")
+@guild_only()
+@needs_auth()
+async def forceresethwid_cmd(interaction: discord.Interaction, user_key: str):
+    await resethwid_cmd.callback(interaction, user_key)
+
+
+@tree.command(name="unlockkey", description="Unlock a key that got auto-locked from HWID mismatches.")
+@app_commands.describe(user_key="The whitelist key to unlock")
+@guild_only()
+@needs_auth()
+async def unlockkey_cmd(interaction: discord.Interaction, user_key: str):
+    r = await db.wl_keys.update_one(
+        {"key": user_key},
+        {"$set": {"status": "active", "hwid_mismatch_count": 0}},
+    )
     if r.matched_count:
-        await _reply(interaction, _ok("HWID reset."))
+        try:
+            await db.hwid_events.insert_one({
+                "id": _secrets_lib.token_hex(16),
+                "key": user_key, "event": "admin_unlock",
+                "actor": str(interaction.user.id),
+                "actor_name": str(interaction.user),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
+        await _reply(interaction, _ok("Key unlocked."))
     else:
         await _reply(interaction, _err("Key not found."))
+
+
+@tree.command(name="perms", description="View or set per-category role permissions for this bot.")
+@app_commands.describe(category="e.g. moderation, protection, channel, role, voice, config",
+                       role="Role required to use commands in this category (omit to clear)")
+@guild_only()
+@needs_auth()
+async def perms_cmd(interaction: discord.Interaction, category: Optional[str] = None,
+                    role: Optional[discord.Role] = None):
+    doc = await db.bot_config.find_one({}, {"_id": 0}) or {}
+    perms = doc.get("command_role_perms") or {}
+    if not category:
+        if not perms:
+            await _reply(interaction, "_No per-category role gate configured (using global allow-list only)._")
+            return
+        lines = ["**Per-category role gate:**"]
+        for cat, ids in perms.items():
+            mentions = ", ".join(f"<@&{rid}>" for rid in ids) or "_none_"
+            lines.append(f"• `{cat}` → {mentions}")
+        await _reply(interaction, "\n".join(lines))
+        return
+    category = category.strip().lower()
+    cur = list(perms.get(category, []))
+    if role is None:
+        # Clear the category
+        perms.pop(category, None)
+        await db.bot_config.update_one({}, {"$set": {"command_role_perms": perms}})
+        await _refresh_perms_from_backend()
+        await _reply(interaction, _ok(f"Cleared role gate for `{category}` (falls back to global)."))
+        return
+    rid = str(role.id)
+    if rid in cur:
+        cur.remove(rid)
+        msg = f"Removed {role.mention} from `{category}` gate."
+    else:
+        cur.append(rid)
+        msg = f"Added {role.mention} to `{category}` gate."
+    perms[category] = cur
+    await db.bot_config.update_one({}, {"$set": {"command_role_perms": perms}})
+    await _refresh_perms_from_backend()
+    await _reply(interaction, _ok(msg))
 
 
 @tree.command(name="keyinfo", description="Look up details of a key.")

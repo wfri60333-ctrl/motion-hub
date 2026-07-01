@@ -1,23 +1,87 @@
 """
 Lua Obfuscator — MOD_CTRL
-Uses the luaobfuscator.com HTTP API (real, professional-grade obfuscation with control
-flow flattening, string encryption, VM virtualization, etc).
 
-Falls back to the built-in multi-layer XOR/base64 obfuscator when no API key is set.
-Get a free API key at: https://luaobfuscator.com/forum/keys
+Engines (in priority order):
+  1. Prometheus (open-source, bundled)  → best quality, VM-based, control-flow flattening.
+     Requires `lua5.3` on the host. Uses presets: Minify / Weak / Medium / Strong.
+  2. luaobfuscator.com API               → if a user API key is configured.
+  3. Built-in XOR/Base64 multi-layer     → last-resort fallback.
+
+Levels → engine map:
+  light   → Prometheus "Weak"     (fast, small blow-up)
+  medium  → Prometheus "Medium"   (VM, string encryption)
+  heavy   → Prometheus "Strong"   (full control-flow flattening, VM, junk code)
 """
 from __future__ import annotations
+import asyncio
 import base64
+import os
 import re
 import secrets
 import string
-from typing import Optional
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple
 
 import httpx
 
+# ---------- Prometheus config ----------
+PROMETHEUS_DIR = Path(__file__).parent / "prometheus"
+PROMETHEUS_CLI = PROMETHEUS_DIR / "cli.lua"
+LUA_BIN = os.environ.get("LUA_BIN", "lua5.3")
+
+# Map our level names to Prometheus preset names.
+PROMETHEUS_PRESET = {
+    "light": "Weak",
+    "medium": "Medium",
+    "heavy": "Strong",
+}
+
+
+def _prometheus_available() -> bool:
+    """Check that lua5.3 + Prometheus source are both on-disk."""
+    if not PROMETHEUS_CLI.exists():
+        return False
+    try:
+        subprocess.run([LUA_BIN, "-v"], capture_output=True, timeout=3, check=False)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+async def obfuscate_via_prometheus(code: str, level: str) -> str:
+    """Shell out to Prometheus CLI. Runs in a thread so it doesn't block the loop."""
+    preset = PROMETHEUS_PRESET.get(level, "Medium")
+
+    def _run() -> str:
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.lua"
+            out = Path(td) / "out.lua"
+            src.write_text(code, encoding="utf-8")
+            r = subprocess.run(
+                [LUA_BIN, str(PROMETHEUS_CLI),
+                 "--preset", preset,
+                 "--nocolors",
+                 "--out", str(out),
+                 str(src)],
+                cwd=str(PROMETHEUS_DIR),
+                capture_output=True,
+                timeout=90,
+            )
+            if r.returncode != 0 or not out.exists():
+                raise RuntimeError(
+                    f"prometheus failed (rc={r.returncode}): "
+                    f"{(r.stderr or r.stdout).decode(errors='replace')[:800]}"
+                )
+            return out.read_text(encoding="utf-8", errors="replace")
+
+    return await asyncio.to_thread(_run)
+
+
+# ---------- luaobfuscator.com (secondary) ----------
 LUAOBFUSCATOR_BASE = "https://api.luaobfuscator.com/v1"
 
-# Preset plugin configs for each level
 PRESETS = {
     "light": {
         "MinifiyAll": True,
@@ -57,12 +121,9 @@ class LuaObfuscatorAPIError(Exception):
 
 
 async def obfuscate_via_api(code: str, level: str, api_key: str) -> str:
-    """Two-step call: create session → apply obfuscation."""
     if level not in PRESETS:
         raise LuaObfuscatorAPIError(f"Invalid level: {level}")
-
     async with httpx.AsyncClient(timeout=60) as h:
-        # 1. new session
         r = await h.post(
             f"{LUAOBFUSCATOR_BASE}/obfuscator/newscript",
             headers={"apikey": api_key, "content-type": "text/plain"},
@@ -76,8 +137,6 @@ async def obfuscate_via_api(code: str, level: str, api_key: str) -> str:
             raise LuaObfuscatorAPIError(
                 f"newscript returned no session: {data.get('message') or data}"
             )
-
-        # 2. obfuscate
         r2 = await h.post(
             f"{LUAOBFUSCATOR_BASE}/obfuscator/obfuscate",
             headers={
@@ -95,10 +154,7 @@ async def obfuscate_via_api(code: str, level: str, api_key: str) -> str:
         return out.get("code") or ""
 
 
-# ==================================================================
-# Fallback built-in obfuscator (used when no API key is configured)
-# ==================================================================
-
+# ---------- Built-in fallback (last resort) ----------
 _STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', re.DOTALL)
 _COMMENT_LINE_RE = re.compile(r"--[^\n\r]*")
 _COMMENT_BLOCK_RE = re.compile(r"--\[\[.*?\]\]", re.DOTALL)
@@ -144,9 +200,8 @@ def obfuscate_fallback(code: str, level: str = "medium") -> str:
     code = _strip(code)
     key = secrets.token_hex(6)
     dec = _rand(10)
-
-    # Encrypt string literals
     kb = key.encode()
+
     def repl(m):
         raw = m.group(0)[1:-1]
         cipher = _xor_bytes(raw.encode("utf-8", "ignore"), kb)
@@ -154,7 +209,6 @@ def obfuscate_fallback(code: str, level: str = "medium") -> str:
     code = _STRING_RE.sub(repl, code)
     code = DECODER.format(dec=dec, key=key) + "\n" + code
 
-    # Number obfuscation
     if level in ("medium", "heavy"):
         def numrepl(m):
             n = int(m.group(1))
@@ -163,7 +217,6 @@ def obfuscate_fallback(code: str, level: str = "medium") -> str:
             return f"({a}+{n-a})"
         code = _NUM_RE.sub(numrepl, code)
 
-    # Wrap layers
     layers = 1 if level == "light" else (2 if level == "medium" else 3)
     for _ in range(layers):
         k2 = secrets.token_hex(8)
@@ -184,15 +237,41 @@ def obfuscate_fallback(code: str, level: str = "medium") -> str:
     return f"-- Obfuscated by MOD_CTRL (built-in, {layers} layers)\n" + code
 
 
+# ---------- Public entrypoint ----------
 async def obfuscate(code: str, level: str = "medium",
-                    api_key: Optional[str] = None) -> tuple[str, str]:
-    """Try API first if key provided, else fallback. Returns (output, engine_used)."""
-    if api_key:
+                    api_key: Optional[str] = None,
+                    engine: Optional[str] = None) -> Tuple[str, str]:
+    """Try Prometheus → luaobfuscator.com API → built-in.
+
+    `engine` can be "prometheus", "luaobfuscator", "builtin", or None (auto).
+    Returns (obfuscated_output, engine_used_label).
+    """
+    if level not in ("light", "medium", "heavy"):
+        level = "medium"
+
+    # 1) Prometheus (default when available)
+    if engine in (None, "prometheus", "auto") and _prometheus_available():
+        try:
+            out = await obfuscate_via_prometheus(code, level)
+            return out, f"prometheus ({PROMETHEUS_PRESET[level]})"
+        except Exception as e:
+            if engine == "prometheus":
+                # user forced it — surface the error via fallback message
+                pass
+            # fall through
+            fallback_reason = f"prometheus error: {e}"
+        else:
+            fallback_reason = ""
+    else:
+        fallback_reason = "prometheus unavailable"
+
+    # 2) luaobfuscator.com API (if key provided)
+    if api_key and engine in (None, "luaobfuscator", "auto"):
         try:
             out = await obfuscate_via_api(code, level, api_key)
             return out, "luaobfuscator.com"
         except Exception as e:
-            # Fall through to built-in
-            fallback = obfuscate_fallback(code, level)
-            return fallback, f"fallback (API error: {e})"
-    return obfuscate_fallback(code, level), "built-in"
+            fallback_reason = f"{fallback_reason}; api error: {e}" if fallback_reason else f"api error: {e}"
+
+    # 3) Built-in fallback
+    return obfuscate_fallback(code, level), f"built-in ({fallback_reason})" if fallback_reason else "built-in"
