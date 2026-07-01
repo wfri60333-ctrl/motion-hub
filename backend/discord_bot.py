@@ -1454,6 +1454,60 @@ async def keyinfo_cmd(interaction: discord.Interaction, user_key: str):
     await _reply(interaction, "", embed=e, ephemeral=False)
 
 
+@tree.command(name="obfuscate", description="Obfuscate an attached .lua file.")
+@app_commands.describe(file="Your .lua file (max 500 KB)", level="Protection intensity")
+@app_commands.choices(level=[
+    app_commands.Choice(name="Light — strings only", value="light"),
+    app_commands.Choice(name="Medium — strings + numbers", value="medium"),
+    app_commands.Choice(name="Heavy — 3 layers + anti-hook", value="heavy"),
+])
+@guild_only()
+@needs_auth()
+async def obfuscate_cmd(interaction: discord.Interaction, file: discord.Attachment,
+                        level: Optional[app_commands.Choice[str]] = None):
+    lvl = level.value if level else "medium"
+    if file.size > 500_000:
+        await _reply(interaction, _err("File too large (max 500 KB)."))
+        return
+    if not (file.filename.endswith(".lua") or file.filename.endswith(".txt")):
+        await _reply(interaction, _err("Attach a `.lua` or `.txt` file."))
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        raw = await file.read()
+        code = raw.decode("utf-8", errors="replace")
+    except Exception as e:
+        await interaction.followup.send(_err(f"Failed to read file: {e}"), ephemeral=True)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=45) as http:
+            r = await http.post(f"{BOT_API_URL}/api/obfuscate",
+                                json={"code": code, "level": lvl})
+            if r.status_code >= 400:
+                await interaction.followup.send(
+                    _err(f"Obfuscator API returned {r.status_code}: {r.text[:300]}"),
+                    ephemeral=True)
+                return
+            data = r.json()
+            output = data.get("output", "")
+            engine = data.get("engine", "?")
+    except Exception as e:
+        await interaction.followup.send(_err(f"Failed to reach obfuscator: {e}"), ephemeral=True)
+        return
+
+    import io as _io
+    out_name = file.filename.rsplit(".", 1)[0] + f"_obf_{lvl}.lua"
+    buf = _io.BytesIO(output.encode("utf-8"))
+    discord_file = discord.File(buf, filename=out_name)
+    embed = discord.Embed(title="✨ Obfuscation Complete", color=0x34C759)
+    embed.add_field(name="Level", value=lvl.upper(), inline=True)
+    embed.add_field(name="Engine", value=engine, inline=True)
+    embed.add_field(name="Input", value=f"{len(code)} bytes", inline=True)
+    embed.add_field(name="Output", value=f"{len(output)} bytes", inline=True)
+    embed.add_field(name="Inflation", value=f"×{len(output)/max(1,len(code)):.1f}", inline=True)
+    await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
+
+
 # ============= HEARTBEAT =============
 async def _heartbeat_loop():
     await client.wait_until_ready()

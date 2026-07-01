@@ -350,6 +350,7 @@ async def list_commands():
         ("revoke", "Revoke a key (immediate).", "protection", True),
         ("resethwid", "Force-reset HWID for a key.", "protection", False),
         ("keyinfo", "Look up details of a key.", "protection", False),
+        ("obfuscate", "Obfuscate a .lua file attachment (light/medium/heavy).", "protection", False),
     ]
     return {
         "commands": [
@@ -601,6 +602,48 @@ async def remove_script_from_loader(loader_id: str, script_id: str):
         {"$unset": {"loader_id": "", "slug": ""}},
     )
     return {"ok": True, "modified": r.modified_count}
+
+
+class LoaderUpload(BaseModel):
+    name: str
+    slug: str
+    level: str = "heavy"
+    code: str
+
+
+@api_router.post("/loaders/{loader_id}/upload")
+async def upload_to_loader(loader_id: str, payload: LoaderUpload):
+    """One-shot: obfuscate the code + save it as a script + attach to the loader with slug."""
+    loader = await db.loaders.find_one({"id": loader_id}, {"_id": 0})
+    if not loader:
+        raise HTTPException(status_code=404, detail="Loader not found")
+    if payload.level not in ("light", "medium", "heavy"):
+        raise HTTPException(status_code=400, detail="Invalid level")
+    if not payload.code.strip():
+        raise HTTPException(status_code=400, detail="Code cannot be empty")
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "-", payload.slug.strip().lower())[:32] or "script"
+    if await db.scripts.find_one({"loader_id": loader_id, "slug": slug}, {"_id": 0}):
+        raise HTTPException(status_code=400, detail=f"Slug '{slug}' already used in this loader")
+    cfg = await get_or_create_config()
+    api_key = (cfg.get("luaobfuscator_api_key") or "").strip() or None
+    obf_out, engine = await _obfuscate_lua(payload.code, payload.level, api_key)
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": payload.name.strip(),
+        "source": payload.code,
+        "obfuscated": obf_out,
+        "level": payload.level,
+        "loader_id": loader_id,
+        "slug": slug,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_bytes": len(payload.code),
+        "output_bytes": len(obf_out),
+    }
+    await db.scripts.insert_one(doc)
+    doc.pop("_id", None)
+    doc.pop("source", None)
+    doc.pop("obfuscated", None)
+    return {"ok": True, "script": doc, "engine": engine}
 
 
 import re as _re_module  # ensure re is available above (already imported at top)

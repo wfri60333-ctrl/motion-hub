@@ -195,10 +195,62 @@ export default function LoadersPage() {
               {unattached.length > 0 && (
                 <AttachRow loader={L} scripts={unattached} onAttach={attach} />
               )}
+
+              {/* One-shot upload + obfuscate + attach */}
+              <UploadRow loader={L} onDone={load} />
             </div>
           </div>
         ))
       )}
+    </div>
+  );
+}
+
+function UploadRow({ loader, onDone }) {
+  const [name, setName] = useState("");
+  const [slug, setSlug] = useState("");
+  const [level, setLevel] = useState("heavy");
+  const [busy, setBusy] = useState(false);
+
+  const upload = async (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (!name.trim() || !slug.trim()) { toast.error("Name and slug required first"); e.target.value=""; return; }
+    setBusy(true);
+    try {
+      const code = await f.text();
+      const r = await api.post(`/loaders/${loader.id}/upload`, {
+        name: name.trim(), slug: slug.trim(), level, code,
+      });
+      toast.success(`Obfuscated + attached (×${(r.data.script.output_bytes/Math.max(1,r.data.script.source_bytes)).toFixed(1)})`);
+      setName(""); setSlug("");
+      await onDone();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Upload failed");
+    } finally {
+      setBusy(false);
+      e.target.value = "";
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-[1fr_140px_120px_auto] gap-2 mt-2 pt-2 border-t border-white/10">
+      <input value={name} onChange={(e) => setName(e.target.value)}
+        placeholder="script name (e.g. Aimbot v2)"
+        className="bg-black border border-white/15 focus:border-[#34C759] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30" />
+      <input value={slug} onChange={(e) => setSlug(e.target.value)}
+        placeholder="slug (aimbot)"
+        className="bg-black border border-white/15 focus:border-[#34C759] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30" />
+      <select value={level} onChange={(e) => setLevel(e.target.value)}
+        className="bg-black border border-white/15 focus:border-[#34C759] outline-none px-3 py-2 font-mono text-xs text-white">
+        <option value="light">Light</option>
+        <option value="medium">Medium</option>
+        <option value="heavy">Heavy</option>
+      </select>
+      <label className={`inline-flex items-center justify-center gap-1 border border-[#34C759] bg-[#34C759]/10 hover:bg-[#34C759]/20 text-[#34C759] px-3 py-2 text-[10px] uppercase tracking-widest font-bold cursor-pointer transition-colors duration-75 ${busy ? "opacity-50 pointer-events-none" : ""}`}>
+        {busy ? "Obfuscating…" : "↑ Upload .lua"}
+        <input type="file" accept=".lua,.txt" className="hidden" onChange={upload} disabled={busy} />
+      </label>
     </div>
   );
 }
