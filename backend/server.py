@@ -44,6 +44,7 @@ LOG_BUFFER: deque = deque(maxlen=2000)
 BOT_PROCESS: Optional[subprocess.Popen] = None
 BOT_STARTED_AT: Optional[datetime] = None
 LOG_READER_TASK: Optional[asyncio.Task] = None
+AUTO_RESTART: bool = True  # flipped to False when user clicks Halt
 
 BOT_RUNTIME = {
     "ready": False,
@@ -111,8 +112,17 @@ async def _read_bot_stdout(proc: subprocess.Popen):
             break
         text = line.decode(errors="replace") if isinstance(line, bytes) else line
         _push_log(text)
-    _push_log("[bot process exited]")
+    exit_code = proc.poll()
+    _push_log(f"[bot process exited] code={exit_code}")
     BOT_RUNTIME["ready"] = False
+    # Auto-restart unless user explicitly requested halt
+    if AUTO_RESTART:
+        await asyncio.sleep(3)
+        _push_log("[control] auto-restart scheduled — relaunching bot")
+        try:
+            await bot_start()
+        except Exception as e:
+            _push_log(f"[control] auto-restart failed: {e}")
 
 
 def _is_bot_running() -> bool:
@@ -168,7 +178,8 @@ async def bot_status():
 
 @api_router.post("/bot/start")
 async def bot_start():
-    global BOT_PROCESS, BOT_STARTED_AT, LOG_READER_TASK
+    global BOT_PROCESS, BOT_STARTED_AT, LOG_READER_TASK, AUTO_RESTART
+    AUTO_RESTART = True
     if _is_bot_running():
         return {"ok": True, "message": "Bot already running", "pid": BOT_PROCESS.pid}
 
@@ -202,7 +213,8 @@ async def bot_start():
 
 @api_router.post("/bot/stop")
 async def bot_stop():
-    global BOT_PROCESS, BOT_STARTED_AT
+    global BOT_PROCESS, BOT_STARTED_AT, AUTO_RESTART
+    AUTO_RESTART = False  # user requested halt — do NOT auto-restart
     if not _is_bot_running():
         return {"ok": True, "message": "Bot is not running"}
     _push_log("[control] stopping bot")
@@ -356,8 +368,27 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def _startup_autoboot():
+    """Auto-launch the bot whenever the backend starts, if a token is configured."""
+    async def _boot():
+        try:
+            await asyncio.sleep(1.5)  # allow mongo/motor to warm up
+            cfg = await get_or_create_config()
+            if (cfg.get("bot_token") or "").strip():
+                _push_log("[control] backend boot — auto-starting bot")
+                await bot_start()
+            else:
+                _push_log("[control] backend boot — no token configured, skipping auto-start")
+        except Exception as e:
+            _push_log(f"[control] auto-start on boot failed: {e}")
+    asyncio.create_task(_boot())
+
+
 @app.on_event("shutdown")
 async def _shutdown():
+    global AUTO_RESTART
+    AUTO_RESTART = False
     if _is_bot_running():
         try:
             BOT_PROCESS.terminate()

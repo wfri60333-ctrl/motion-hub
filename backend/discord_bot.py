@@ -430,35 +430,140 @@ async def snipe_cmd(interaction: discord.Interaction):
 
 
 # ============= CHANNEL WIPE / NUKE =============
-@tree.command(name="wipe", description="⚠️  Delete EVERY channel in this server. Irreversible.")
-@app_commands.describe(confirm='Type "WIPE" (uppercase) to confirm this destructive action.')
+OWNER_ROLE_NAME = "Owner"
+
+
+def _has_owner_role(member: discord.Member) -> bool:
+    return isinstance(member, discord.Member) and any(
+        (r.name or "").lower() == OWNER_ROLE_NAME.lower() for r in member.roles
+    )
+
+
+class WipeConfirmView(discord.ui.View):
+    def __init__(self, initiator_id: int, guild_id: int, channel_count: int):
+        super().__init__(timeout=120)
+        self.initiator_id = initiator_id
+        self.guild_id = guild_id
+        self.channel_count = channel_count
+        self.done = False
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self):
+        if self.done or not self.message:
+            return
+        for c in self.children:
+            c.disabled = True
+        try:
+            await self.message.edit(
+                content="⌛ **Wipe request timed out.** No action taken.",
+                view=self,
+            )
+        except Exception:
+            pass
+
+    @discord.ui.button(label="✓  YES — WIPE EVERYTHING",
+                       style=discord.ButtonStyle.danger, custom_id="wipe_confirm_yes")
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            await interaction.response.send_message(
+                "This request has already been resolved.", ephemeral=True)
+            return
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(member.id) if interaction.guild else None
+        if not member or not _has_owner_role(member):
+            # PUBLIC denial
+            await interaction.response.send_message(
+                f"🚫 {interaction.user.mention} tried to confirm the wipe but does **not** "
+                f"hold the **{OWNER_ROLE_NAME}** role. Access denied.",
+                ephemeral=False,
+            )
+            return
+
+        self.done = True
+        for c in self.children:
+            c.disabled = True
+        try:
+            await interaction.response.edit_message(
+                content=(f"💥 **{interaction.user.mention} confirmed the wipe.**\n"
+                         f"Deleting **{self.channel_count}** channels now…"),
+                view=self,
+            )
+        except Exception:
+            pass
+
+        guild = interaction.guild
+        channels = list(guild.channels)
+        _log(f"[wipe] confirmed by {member} ({member.id}) on {guild.name} — {len(channels)} channels")
+        deleted, failed = 0, 0
+        for ch in channels:
+            try:
+                await ch.delete(reason=f"Wipe confirmed by {member}")
+                deleted += 1
+                _log(f"  ✓ deleted #{ch.name}")
+            except Exception as e:
+                failed += 1
+                _log(f"  ✗ failed #{ch.name}: {e}")
+        _log(f"[wipe] complete — deleted={deleted} failed={failed}")
+        await _post_audit({
+            "guild_id": str(guild.id), "guild_name": guild.name,
+            "actor_id": str(member.id), "actor_name": str(member),
+            "action": "wipe_channels",
+            "details": {"deleted": deleted, "failed": failed,
+                        "trigger": "button_confirm"},
+        })
+
+    @discord.ui.button(label="✕  NO — Cancel",
+                       style=discord.ButtonStyle.secondary, custom_id="wipe_confirm_no")
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            await interaction.response.send_message(
+                "This request has already been resolved.", ephemeral=True)
+            return
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(member.id) if interaction.guild else None
+        if not member or not _has_owner_role(member):
+            await interaction.response.send_message(
+                f"🚫 {interaction.user.mention} tried to cancel the wipe but does **not** "
+                f"hold the **{OWNER_ROLE_NAME}** role. Only the Owner can decide.",
+                ephemeral=False,
+            )
+            return
+
+        self.done = True
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ **Wipe canceled** by {interaction.user.mention}.",
+            view=self,
+        )
+
+
+@tree.command(name="wipe",
+              description="⚠️  Public confirmation to delete EVERY channel. Owner role only.")
 @guild_only()
 @needs_auth()
-async def wipe_cmd(interaction: discord.Interaction, confirm: str):
-    if confirm.strip() != "WIPE":
-        await _reply(interaction, _err('Confirmation failed. Pass exactly `WIPE` (uppercase).'))
-        return
+async def wipe_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     channels = list(guild.channels)
-    _log(f"[wipe] initiated by {interaction.user} on {guild.name} — {len(channels)} channels")
-    await interaction.response.send_message(
-        f"⚠️  Wiping **{len(channels)}** channels…", ephemeral=True)
-    deleted, failed = 0, 0
-    for ch in channels:
-        try:
-            await ch.delete(reason=f"Wipe by {interaction.user}")
-            deleted += 1
-            _log(f"  ✓ deleted #{ch.name}")
-        except Exception as e:
-            failed += 1
-            _log(f"  ✗ failed #{ch.name}: {e}")
-    _log(f"[wipe] complete — deleted={deleted} failed={failed}")
-    await _post_audit({
-        "guild_id": str(guild.id), "guild_name": guild.name,
-        "actor_id": str(interaction.user.id), "actor_name": str(interaction.user),
-        "action": "wipe_channels",
-        "details": {"deleted": deleted, "failed": failed},
-    })
+    view = WipeConfirmView(interaction.user.id, guild.id, len(channels))
+    content = (
+        f"⚠️  **SERVER WIPE REQUESTED** — by {interaction.user.mention}\n"
+        f"This will delete **{len(channels)}** channels in **{guild.name}**. "
+        f"This action is **irreversible**.\n\n"
+        f"🔒 Only a member with the **{OWNER_ROLE_NAME}** role can confirm or cancel. "
+        f"Anyone else who clicks will be publicly denied.\n"
+        f"⌛ Request auto-expires in 2 minutes."
+    )
+    # PUBLIC — everyone in the channel sees this
+    await interaction.response.send_message(content=content, view=view, ephemeral=False)
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        pass
+    _log(f"[wipe] request opened by {interaction.user} on {guild.name} "
+         f"({len(channels)} channels) — awaiting Owner confirmation")
 
 
 @tree.command(name="nuke", description="Clone this channel and delete the original (wipes messages).")
