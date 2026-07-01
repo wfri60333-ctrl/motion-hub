@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from dotenv import load_dotenv
 import uuid
 
+import re
 from obfuscator import obfuscate as _obfuscate_lua
 
 ROOT_DIR = Path(__file__).parent
@@ -450,18 +451,30 @@ from fastapi.responses import PlainTextResponse
 
 
 class KeyCreate(BaseModel):
-    script_id: str
+    script_id: Optional[str] = None
+    loader_id: Optional[str] = None  # if set, key grants access to the whole loader
     discord_id: Optional[str] = None
     note: Optional[str] = None
-    expires_days: Optional[int] = None  # None = never expires
+    expires_days: Optional[int] = None
 
 
 @api_router.post("/keys")
 async def create_key(payload: KeyCreate):
-    """Generate a whitelist key for a saved script."""
-    script = await db.scripts.find_one({"id": payload.script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
-    if not script:
-        raise HTTPException(status_code=404, detail="Script not found")
+    """Generate a whitelist key. Scope to a single script OR a whole loader."""
+    if not payload.script_id and not payload.loader_id:
+        raise HTTPException(status_code=400, detail="Provide either script_id or loader_id")
+    script_name = None
+    loader_name = None
+    if payload.loader_id:
+        loader = await db.loaders.find_one({"id": payload.loader_id}, {"_id": 0})
+        if not loader:
+            raise HTTPException(status_code=404, detail="Loader not found")
+        loader_name = loader.get("name")
+    if payload.script_id:
+        script = await db.scripts.find_one({"id": payload.script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        script_name = script.get("name")
     now = datetime.now(timezone.utc)
     expires_at = None
     if payload.expires_days and payload.expires_days > 0:
@@ -469,8 +482,10 @@ async def create_key(payload: KeyCreate):
     doc = {
         "id": str(uuid.uuid4()),
         "key": _secrets.token_urlsafe(24),
-        "script_id": payload.script_id,
-        "script_name": script.get("name"),
+        "script_id": payload.script_id or None,
+        "script_name": script_name,
+        "loader_id": payload.loader_id or None,
+        "loader_name": loader_name,
         "discord_id": payload.discord_id or None,
         "note": payload.note or None,
         "hwid": None,
@@ -507,35 +522,210 @@ async def reset_key_hwid(key_id: str):
 from datetime import timedelta
 
 
+# ============= LOADERS (grouping scripts under one product) =============
+class LoaderCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class LoaderAddScript(BaseModel):
+    script_id: str
+    slug: str  # short name inside the loader, e.g. "aimbot", "esp"
+
+
+@api_router.post("/loaders")
+async def create_loader(payload: LoaderCreate):
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": payload.name,
+        "description": payload.description or None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.loaders.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "loader": doc}
+
+
+@api_router.get("/loaders")
+async def list_loaders():
+    loaders = await db.loaders.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    # Attach script listings
+    for L in loaders:
+        L["scripts"] = await db.scripts.find(
+            {"loader_id": L["id"]},
+            {"_id": 0, "obfuscated": 0, "source": 0},
+        ).to_list(200)
+    return {"loaders": loaders}
+
+
+@api_router.delete("/loaders/{loader_id}")
+async def delete_loader(loader_id: str):
+    r = await db.loaders.delete_one({"id": loader_id})
+    # Also detach scripts (don't delete them)
+    await db.scripts.update_many({"loader_id": loader_id}, {"$unset": {"loader_id": "", "slug": ""}})
+    return {"ok": True, "deleted": r.deleted_count}
+
+
+@api_router.post("/loaders/{loader_id}/scripts")
+async def add_script_to_loader(loader_id: str, payload: LoaderAddScript):
+    loader = await db.loaders.find_one({"id": loader_id}, {"_id": 0})
+    if not loader:
+        raise HTTPException(status_code=404, detail="Loader not found")
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "-", payload.slug.strip().lower())[:32] or "script"
+    # ensure unique slug within loader
+    exists = await db.scripts.find_one({"loader_id": loader_id, "slug": slug}, {"_id": 0})
+    if exists and exists["id"] != payload.script_id:
+        raise HTTPException(status_code=400, detail=f"Slug '{slug}' already used in this loader")
+    r = await db.scripts.update_one(
+        {"id": payload.script_id},
+        {"$set": {"loader_id": loader_id, "slug": slug}},
+    )
+    return {"ok": True, "modified": r.modified_count, "slug": slug}
+
+
+@api_router.delete("/loaders/{loader_id}/scripts/{script_id}")
+async def remove_script_from_loader(loader_id: str, script_id: str):
+    r = await db.scripts.update_one(
+        {"id": script_id, "loader_id": loader_id},
+        {"$unset": {"loader_id": "", "slug": ""}},
+    )
+    return {"ok": True, "modified": r.modified_count}
+
+
+import re as _re_module  # ensure re is available above (already imported at top)
+
+
 @api_router.get("/loader/{script_id}.lua", response_class=PlainTextResponse)
-async def get_loader(script_id: str, request: Request = None):
-    """Returns a Lua stub that prompts the user for their key and fetches the payload."""
+async def get_loader_or_script(script_id: str, request: Request = None):
+    """
+    Universal loader endpoint. `script_id` can be:
+      - a script's id (standalone mode, backward compatible)
+      - a loader's id (menu mode — returns table with :load('slug') method)
+    """
+    base = str(request.base_url).rstrip("/") if request else "http://localhost:8001"
+    # Check if it's a loader
+    loader = await db.loaders.find_one({"id": script_id}, {"_id": 0})
+    if loader:
+        return _menu_loader_stub(loader, base)
+    # Otherwise treat as standalone script
     script = await db.scripts.find_one({"id": script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
     if not script:
-        raise HTTPException(status_code=404, detail="Script not found")
-    # Build absolute base URL from request
+        raise HTTPException(status_code=404, detail="Not found")
+    return _standalone_loader_stub(script, base)
+
+
+@api_router.get("/loader/{loader_id}/bundle.lua", response_class=PlainTextResponse)
+async def get_loader_bundle(loader_id: str, request: Request = None):
+    """All-in-one bundle mode: runs every script in the loader at once."""
+    loader = await db.loaders.find_one({"id": loader_id}, {"_id": 0})
+    if not loader:
+        raise HTTPException(status_code=404, detail="Loader not found")
     base = str(request.base_url).rstrip("/") if request else "http://localhost:8001"
-    return f"""-- MOD_CTRL Loader for script: {script.get('name')}
--- Usage:  script_key = "YOUR_KEY_HERE"; loadstring(game:HttpGet("<this loader url>"))()
+    scripts = await db.scripts.find(
+        {"loader_id": loader_id},
+        {"_id": 0, "obfuscated": 0, "source": 0},
+    ).to_list(100)
+    slugs = [s.get("slug") or s["id"] for s in scripts]
+    return f"""-- MOD_CTRL Bundle for loader: {loader['name']}
 if not script_key or #script_key < 8 then
-    return warn("[MOD_CTRL] Please set script_key before loading this loader.")
+    return warn("[MOD_CTRL] Set script_key before loading.")
 end
 local hwid = (gethwid and gethwid()) or (game and game:GetService("RbxAnalyticsService"):GetClientId()) or "unknown"
-local url = "{base}/api/verify?script_id={script_id}&key=" .. script_key .. "&hwid=" .. hwid
-local body = game:HttpGet(url)
-if body:sub(1, 6) == "ERROR:" then
-    return warn("[MOD_CTRL] " .. body)
+for _, slug in ipairs({{"{'","'.join(slugs)}"}}) do
+    local url = "{base}/api/loader/{loader_id}/" .. slug .. ".lua"
+    local body = game:HttpGet(url)
+    if body:sub(1,6) == "ERROR:" then
+        warn("[MOD_CTRL " .. slug .. "] " .. body)
+    else
+        local fn, err = loadstring(body)
+        if fn then pcall(fn) else warn("[MOD_CTRL " .. slug .. "] " .. tostring(err)) end
+    end
 end
+"""
+
+
+@api_router.get("/loader/{loader_id}/{slug}.lua", response_class=PlainTextResponse)
+async def get_loader_script(loader_id: str, slug: str, request: Request = None):
+    """Individual-URL mode: each script under a loader has its own URL, shares the same key."""
+    script = await db.scripts.find_one(
+        {"loader_id": loader_id, "slug": slug},
+        {"_id": 0, "obfuscated": 0, "source": 0},
+    )
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found in loader")
+    base = str(request.base_url).rstrip("/") if request else "http://localhost:8001"
+    return _standalone_loader_stub(script, base, loader_id=loader_id, slug=slug)
+
+
+def _standalone_loader_stub(script: dict, base: str, loader_id: str = None, slug: str = None) -> str:
+    verify_qs = f"script_id={script['id']}"
+    if loader_id:
+        verify_qs += f"&loader_id={loader_id}"
+    return f"""-- MOD_CTRL Loader for script: {script.get('name')}
+if not script_key or #script_key < 8 then
+    return warn("[MOD_CTRL] Set script_key before loading.")
+end
+local hwid = (gethwid and gethwid()) or (game and game:GetService("RbxAnalyticsService"):GetClientId()) or "unknown"
+local url = "{base}/api/verify?{verify_qs}&key=" .. script_key .. "&hwid=" .. hwid
+local body = game:HttpGet(url)
+if body:sub(1, 6) == "ERROR:" then return warn("[MOD_CTRL] " .. body) end
 local fn, err = loadstring(body)
 if not fn then return warn("[MOD_CTRL] load failed: " .. tostring(err)) end
 return fn()
 """
 
 
+def _menu_loader_stub(loader: dict, base: str) -> str:
+    """Menu-mode loader — returns a table with :load(slug) method."""
+    return f"""-- MOD_CTRL Menu Loader: {loader['name']}
+-- Usage:
+--   script_key = "YOUR_KEY"
+--   local Yuna = loadstring(game:HttpGet(".../api/loader/{loader['id']}.lua"))()
+--   Yuna:load("aimbot")
+if not script_key or #script_key < 8 then
+    warn("[MOD_CTRL] Set script_key before using this loader.")
+end
+local L = {{ __key = script_key, __loader = "{loader['id']}", __base = "{base}" }}
+function L:load(slug)
+    if not script_key or #script_key < 8 then return warn("[MOD_CTRL] Missing script_key.") end
+    local hwid = (gethwid and gethwid()) or (game and game:GetService("RbxAnalyticsService"):GetClientId()) or "unknown"
+    local url = self.__base .. "/api/verify?loader_id=" .. self.__loader .. "&slug=" .. slug ..
+                "&key=" .. script_key .. "&hwid=" .. hwid
+    local body = game:HttpGet(url)
+    if body:sub(1,6) == "ERROR:" then return warn("[MOD_CTRL " .. slug .. "] " .. body) end
+    local fn, err = loadstring(body)
+    if not fn then return warn("[MOD_CTRL " .. slug .. "] " .. tostring(err)) end
+    return fn()
+end
+function L:bundle()
+    return loadstring(game:HttpGet(self.__base .. "/api/loader/" .. self.__loader .. "/bundle.lua"))()
+end
+return L
+"""
+
+
 @api_router.get("/verify", response_class=PlainTextResponse)
-async def verify_key(script_id: str, key: str, hwid: str = ""):
-    """Called by the loader. Verifies key + HWID. Returns obfuscated code or ERROR: msg."""
-    row = await db.wl_keys.find_one({"key": key, "script_id": script_id}, {"_id": 0})
+async def verify_key(script_id: Optional[str] = None, loader_id: Optional[str] = None,
+                     slug: Optional[str] = None, key: str = "", hwid: str = ""):
+    """Called by the loader. Verifies key + HWID.
+    Accepts either script_id (standalone) or loader_id + optional slug (loader mode).
+    """
+    if not key:
+        return "ERROR: missing key"
+    # Resolve target script
+    target = None
+    if loader_id:
+        if slug:
+            target = await db.scripts.find_one({"loader_id": loader_id, "slug": slug}, {"_id": 0})
+        # Also allow key lookup by loader_id (any key linked to this loader)
+        row = await db.wl_keys.find_one({"key": key, "loader_id": loader_id}, {"_id": 0})
+        if not row:
+            # backward-compat: also check keys with just script_id if slug script has it
+            if target:
+                row = await db.wl_keys.find_one({"key": key, "script_id": target["id"]}, {"_id": 0})
+    else:
+        target = await db.scripts.find_one({"id": script_id}, {"_id": 0}) if script_id else None
+        row = await db.wl_keys.find_one({"key": key, "script_id": script_id}, {"_id": 0}) if script_id else None
     if not row:
         return "ERROR: invalid key"
     if row.get("status") != "active":
@@ -547,22 +737,20 @@ async def verify_key(script_id: str, key: str, hwid: str = ""):
                 return "ERROR: key expired"
         except Exception:
             pass
-    # HWID lock
     stored_hwid = row.get("hwid")
     if stored_hwid and hwid and stored_hwid != hwid:
         return "ERROR: HWID mismatch. Ask admin to reset."
     if not stored_hwid and hwid:
         await db.wl_keys.update_one({"key": key}, {"$set": {"hwid": hwid}})
-    # Update stats
     await db.wl_keys.update_one(
         {"key": key},
         {"$inc": {"executions": 1},
          "$set": {"last_used": datetime.now(timezone.utc).isoformat()}},
     )
-    script = await db.scripts.find_one({"id": script_id}, {"_id": 0})
-    if not script:
-        return "ERROR: script not found"
-    return script.get("obfuscated") or "ERROR: no payload"
+    if not target:
+        return "ERROR: target script not found"
+    payload = await db.scripts.find_one({"id": target["id"]}, {"_id": 0})
+    return payload.get("obfuscated") or "ERROR: no payload"
 
 
 app.include_router(api_router)

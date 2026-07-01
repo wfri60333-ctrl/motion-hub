@@ -9,6 +9,7 @@ import AuditPage from "@/pages/AuditPage";
 import ObfuscatorPage from "@/pages/ObfuscatorPage";
 import ScriptsPage from "@/pages/ScriptsPage";
 import KeysPage from "@/pages/KeysPage";
+import LoadersPage from "@/pages/LoadersPage";
 
 function App() {
   return (
@@ -20,6 +21,7 @@ function App() {
             <Route path="/commands" element={<CommandsPage />} />
             <Route path="/obfuscate" element={<ObfuscatorPage />} />
             <Route path="/scripts" element={<ScriptsPage />} />
+            <Route path="/loaders" element={<LoadersPage />} />
             <Route path="/keys" element={<KeysPage />} />
             <Route path="/config" element={<ConfigPage />} />
             <Route path="/audit" element={<AuditPage />} />

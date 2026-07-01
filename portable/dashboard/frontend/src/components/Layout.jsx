@@ -1,5 +1,5 @@
 import { Outlet, NavLink } from "react-router-dom";
-import { Terminal, Sliders, ListChecks, ScrollText, Sparkles, FileCode, KeySquare } from "lucide-react";
+import { Terminal, Sliders, ListChecks, ScrollText, Sparkles, FileCode, KeySquare, Layers } from "lucide-react";
 import HeaderBar from "@/components/HeaderBar";
 
 const NAV = [
@@ -7,6 +7,7 @@ const NAV = [
   { to: "/commands", label: "Commands", icon: ListChecks, testid: "nav-commands" },
   { to: "/obfuscate", label: "Obfuscator", icon: Sparkles, testid: "nav-obfuscate" },
   { to: "/scripts", label: "Scripts", icon: FileCode, testid: "nav-scripts" },
+  { to: "/loaders", label: "Loaders", icon: Layers, testid: "nav-loaders" },
   { to: "/keys", label: "Keys", icon: KeySquare, testid: "nav-keys" },
   { to: "/config", label: "Config", icon: Sliders, testid: "nav-config" },
   { to: "/audit", label: "Audit", icon: ScrollText, testid: "nav-audit" },
