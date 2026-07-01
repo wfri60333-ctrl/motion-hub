@@ -6,6 +6,9 @@ import Overview from "@/pages/Overview";
 import CommandsPage from "@/pages/CommandsPage";
 import ConfigPage from "@/pages/ConfigPage";
 import AuditPage from "@/pages/AuditPage";
+import ObfuscatorPage from "@/pages/ObfuscatorPage";
+import ScriptsPage from "@/pages/ScriptsPage";
+import KeysPage from "@/pages/KeysPage";
 
 function App() {
   return (
@@ -15,6 +18,9 @@ function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<Overview />} />
             <Route path="/commands" element={<CommandsPage />} />
+            <Route path="/obfuscate" element={<ObfuscatorPage />} />
+            <Route path="/scripts" element={<ScriptsPage />} />
+            <Route path="/keys" element={<KeysPage />} />
             <Route path="/config" element={<ConfigPage />} />
             <Route path="/audit" element={<AuditPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

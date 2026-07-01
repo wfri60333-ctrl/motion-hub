@@ -9,6 +9,7 @@ export default function ConfigPage() {
   const [appId, setAppId] = useState("");
   const [roles, setRoles] = useState("");
   const [luarmorKey, setLuarmorKey] = useState("");
+  const [luaobfKey, setLuaobfKey] = useState("");
   const [saving, setSaving] = useState(false);
 
   const load = async () => {
@@ -34,10 +35,12 @@ export default function ConfigPage() {
       };
       if (token.trim()) payload.bot_token = token.trim();
       if (luarmorKey.trim()) payload.luarmor_api_key = luarmorKey.trim();
+      if (luaobfKey.trim()) payload.luaobfuscator_api_key = luaobfKey.trim();
       await botApi.updateConfig(payload);
       toast.success("Configuration saved");
       setToken("");
       setLuarmorKey("");
+      setLuaobfKey("");
       await load();
     } catch (e) {
       toast.error("Failed to save configuration");
@@ -141,6 +144,25 @@ export default function ConfigPage() {
             <div className="text-[10px] mt-1.5 uppercase tracking-widest text-white/40">
               Current: {config?.luarmor_api_key_set ? "loaded" : "not set"} · Get one from{" "}
               <a href="https://luarmor.net" target="_blank" rel="noreferrer" className="underline text-white">luarmor.net</a>
+            </div>
+          </Field>
+
+          <Field
+            icon={Shield}
+            label="LuaObfuscator API Key"
+            hint="Free key from luaobfuscator.com/forum/keys. Enables real professional-grade obfuscation (control flow flattening, virtualization, string encryption). Falls back to built-in obfuscator if not set."
+          >
+            <input
+              data-testid="config-luaobf-input"
+              type="password"
+              value={luaobfKey}
+              onChange={(e) => setLuaobfKey(e.target.value)}
+              placeholder={config?.luaobfuscator_api_key_set ? config.luaobfuscator_api_key_masked : "paste luaobfuscator API key"}
+              className="w-full bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2.5 font-mono text-sm text-white placeholder:text-white/25"
+            />
+            <div className="text-[10px] mt-1.5 uppercase tracking-widest text-white/40">
+              Current: {config?.luaobfuscator_api_key_set ? "loaded (real obfuscator)" : "not set (built-in fallback)"} ·{" "}
+              <a href="https://luaobfuscator.com/forum/keys" target="_blank" rel="noreferrer" className="underline text-white">get free key</a>
             </div>
           </Field>
 

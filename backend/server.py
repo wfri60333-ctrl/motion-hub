@@ -13,12 +13,14 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from collections import deque
 
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
 from dotenv import load_dotenv
 import uuid
+
+from obfuscator import obfuscate as _obfuscate_lua
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -59,6 +61,7 @@ class BotConfigUpdate(BaseModel):
     application_id: Optional[str] = None
     allowed_role_ids: Optional[List[str]] = None
     luarmor_api_key: Optional[str] = None
+    luaobfuscator_api_key: Optional[str] = None
 
 
 class AuditCreate(BaseModel):
@@ -150,6 +153,12 @@ async def get_config():
     )
     doc["luarmor_api_key_set"] = bool(lm)
     doc.pop("luarmor_api_key", None)
+    lo = doc.get("luaobfuscator_api_key") or ""
+    doc["luaobfuscator_api_key_masked"] = (
+        (lo[:4] + "•" * 8 + lo[-4:]) if len(lo) > 8 else ("•" * len(lo))
+    )
+    doc["luaobfuscator_api_key_set"] = bool(lo)
+    doc.pop("luaobfuscator_api_key", None)
     return doc
 
 
@@ -165,6 +174,8 @@ async def update_config(payload: BotConfigUpdate):
         updates["allowed_role_ids"] = [r.strip() for r in payload.allowed_role_ids if r.strip()]
     if payload.luarmor_api_key is not None:
         updates["luarmor_api_key"] = payload.luarmor_api_key.strip()
+    if payload.luaobfuscator_api_key is not None:
+        updates["luaobfuscator_api_key"] = payload.luaobfuscator_api_key.strip()
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.bot_config.update_one({"id": current["id"]}, {"$set": updates})
     return {"ok": True}
@@ -371,6 +382,197 @@ async def create_audit(payload: AuditCreate):
 async def update_runtime(payload: RuntimeUpdate):
     BOT_RUNTIME.update(payload.model_dump())
     return {"ok": True}
+
+
+# ============= OBFUSCATION =============
+class ObfuscateRequest(BaseModel):
+    code: str
+    level: str = "medium"  # light | medium | heavy
+
+
+class SavedScriptCreate(BaseModel):
+    name: str
+    source: str
+    obfuscated: str
+    level: str
+    note: Optional[str] = None
+
+
+@api_router.post("/obfuscate")
+async def obfuscate_endpoint(req: ObfuscateRequest):
+    if not req.code or not req.code.strip():
+        raise HTTPException(status_code=400, detail="Code cannot be empty")
+    if req.level not in ("light", "medium", "heavy"):
+        raise HTTPException(status_code=400, detail="Invalid level")
+    cfg = await get_or_create_config()
+    api_key = (cfg.get("luaobfuscator_api_key") or "").strip() or None
+    try:
+        out, engine = await _obfuscate_lua(req.code, req.level, api_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Obfuscation failed: {e}")
+    return {
+        "ok": True,
+        "level": req.level,
+        "engine": engine,
+        "source_bytes": len(req.code),
+        "output_bytes": len(out),
+        "output": out,
+    }
+
+
+@api_router.get("/scripts")
+async def list_scripts():
+    rows = await db.scripts.find({}, {"_id": 0, "source": 0, "obfuscated": 0}).sort(
+        "created_at", -1
+    ).to_list(200)
+    return {"scripts": rows}
+
+
+@api_router.get("/scripts/{script_id}")
+async def get_script(script_id: str):
+    doc = await db.scripts.find_one({"id": script_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    return doc
+
+
+@api_router.post("/scripts")
+async def save_script(payload: SavedScriptCreate):
+    doc = payload.model_dump()
+    doc["id"] = str(uuid.uuid4())
+    doc["created_at"] = datetime.now(timezone.utc).isoformat()
+    doc["source_bytes"] = len(payload.source)
+    doc["output_bytes"] = len(payload.obfuscated)
+    await db.scripts.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "id": doc["id"]}
+
+
+@api_router.delete("/scripts/{script_id}")
+async def delete_script(script_id: str):
+    r = await db.scripts.delete_one({"id": script_id})
+    return {"ok": True, "deleted": r.deleted_count}
+
+
+# ============= SELF-HOSTED WHITELIST (mini-Luarmor) =============
+import secrets as _secrets
+from fastapi.responses import PlainTextResponse
+
+
+class KeyCreate(BaseModel):
+    script_id: str
+    discord_id: Optional[str] = None
+    note: Optional[str] = None
+    expires_days: Optional[int] = None  # None = never expires
+
+
+@api_router.post("/keys")
+async def create_key(payload: KeyCreate):
+    """Generate a whitelist key for a saved script."""
+    script = await db.scripts.find_one({"id": payload.script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    now = datetime.now(timezone.utc)
+    expires_at = None
+    if payload.expires_days and payload.expires_days > 0:
+        expires_at = (now + timedelta(days=int(payload.expires_days))).isoformat()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "key": _secrets.token_urlsafe(24),
+        "script_id": payload.script_id,
+        "script_name": script.get("name"),
+        "discord_id": payload.discord_id or None,
+        "note": payload.note or None,
+        "hwid": None,
+        "status": "active",
+        "executions": 0,
+        "created_at": now.isoformat(),
+        "expires_at": expires_at,
+        "last_used": None,
+    }
+    await db.wl_keys.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "key": doc}
+
+
+@api_router.get("/keys")
+async def list_keys():
+    rows = await db.wl_keys.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return {"keys": rows}
+
+
+@api_router.delete("/keys/{key_id}")
+async def revoke_key(key_id: str):
+    r = await db.wl_keys.delete_one({"id": key_id})
+    return {"ok": True, "deleted": r.deleted_count}
+
+
+@api_router.post("/keys/{key_id}/resethwid")
+async def reset_key_hwid(key_id: str):
+    r = await db.wl_keys.update_one({"id": key_id}, {"$set": {"hwid": None}})
+    return {"ok": True, "modified": r.modified_count}
+
+
+# --- Loader + verify (the actual execution flow) ---
+from datetime import timedelta
+
+
+@api_router.get("/loader/{script_id}.lua", response_class=PlainTextResponse)
+async def get_loader(script_id: str, request: Request = None):
+    """Returns a Lua stub that prompts the user for their key and fetches the payload."""
+    script = await db.scripts.find_one({"id": script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    # Build absolute base URL from request
+    base = str(request.base_url).rstrip("/") if request else "http://localhost:8001"
+    return f"""-- MOD_CTRL Loader for script: {script.get('name')}
+-- Usage:  script_key = "YOUR_KEY_HERE"; loadstring(game:HttpGet("<this loader url>"))()
+if not script_key or #script_key < 8 then
+    return warn("[MOD_CTRL] Please set script_key before loading this loader.")
+end
+local hwid = (gethwid and gethwid()) or (game and game:GetService("RbxAnalyticsService"):GetClientId()) or "unknown"
+local url = "{base}/api/verify?script_id={script_id}&key=" .. script_key .. "&hwid=" .. hwid
+local body = game:HttpGet(url)
+if body:sub(1, 6) == "ERROR:" then
+    return warn("[MOD_CTRL] " .. body)
+end
+local fn, err = loadstring(body)
+if not fn then return warn("[MOD_CTRL] load failed: " .. tostring(err)) end
+return fn()
+"""
+
+
+@api_router.get("/verify", response_class=PlainTextResponse)
+async def verify_key(script_id: str, key: str, hwid: str = ""):
+    """Called by the loader. Verifies key + HWID. Returns obfuscated code or ERROR: msg."""
+    row = await db.wl_keys.find_one({"key": key, "script_id": script_id}, {"_id": 0})
+    if not row:
+        return "ERROR: invalid key"
+    if row.get("status") != "active":
+        return "ERROR: key is not active"
+    exp = row.get("expires_at")
+    if exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now(timezone.utc):
+                return "ERROR: key expired"
+        except Exception:
+            pass
+    # HWID lock
+    stored_hwid = row.get("hwid")
+    if stored_hwid and hwid and stored_hwid != hwid:
+        return "ERROR: HWID mismatch. Ask admin to reset."
+    if not stored_hwid and hwid:
+        await db.wl_keys.update_one({"key": key}, {"$set": {"hwid": hwid}})
+    # Update stats
+    await db.wl_keys.update_one(
+        {"key": key},
+        {"$inc": {"executions": 1},
+         "$set": {"last_used": datetime.now(timezone.utc).isoformat()}},
+    )
+    script = await db.scripts.find_one({"id": script_id}, {"_id": 0})
+    if not script:
+        return "ERROR: script not found"
+    return script.get("obfuscated") or "ERROR: no payload"
 
 
 app.include_router(api_router)
