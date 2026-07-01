@@ -242,16 +242,83 @@ async def clear_logs():
 
 @api_router.get("/bot/commands")
 async def list_commands():
+    cmds = [
+        # moderation
+        ("wipe", "Delete every channel in this server.", "moderation", True),
+        ("nuke", "Clone this channel and delete the original (wipes messages).", "moderation", True),
+        ("ban", "Ban a member from the server.", "moderation", True),
+        ("unban", "Unban a user by ID.", "moderation", False),
+        ("kick", "Kick a member.", "moderation", True),
+        ("timeout", "Timeout (mute) a member for a duration.", "moderation", False),
+        ("untimeout", "Remove a timeout.", "moderation", False),
+        ("warn", "Warn a member (persists in database).", "moderation", False),
+        ("warnings", "Show warnings for a member.", "moderation", False),
+        ("clearwarnings", "Delete all warnings for a member.", "moderation", False),
+        ("purge", "Bulk delete recent messages.", "moderation", True),
+        ("snipe", "Show last deleted message in this channel.", "moderation", False),
+        ("banlist", "Show recent bans.", "moderation", False),
+        # channel
+        ("lock", "Lock this channel.", "channel", False),
+        ("unlock", "Unlock this channel.", "channel", False),
+        ("hide", "Hide this channel from @everyone.", "channel", False),
+        ("show", "Reveal this channel.", "channel", False),
+        ("slowmode", "Set channel slowmode.", "channel", False),
+        ("rename", "Rename the current channel.", "channel", False),
+        ("topic", "Set channel topic.", "channel", False),
+        ("nsfw", "Toggle NSFW.", "channel", False),
+        ("clone", "Clone this channel.", "channel", False),
+        ("createchannel", "Create a new text channel.", "channel", False),
+        ("deletechannel", "Delete a channel.", "channel", True),
+        ("channelinfo", "Info about the current channel.", "channel", False),
+        # role
+        ("addrole", "Add a role to a member.", "role", False),
+        ("removerole", "Remove a role from a member.", "role", False),
+        ("createrole", "Create a role.", "role", False),
+        ("deleterole", "Delete a role.", "role", True),
+        ("rolecolor", "Change a role's color.", "role", False),
+        ("roleinfo", "Info about a role.", "role", False),
+        ("rolelist", "List all roles.", "role", False),
+        # nickname
+        ("nick", "Change a member's nickname.", "nickname", False),
+        ("resetnick", "Reset a member's nickname.", "nickname", False),
+        # voice
+        ("vmute", "Voice-mute a member.", "voice", False),
+        ("vunmute", "Voice-unmute a member.", "voice", False),
+        ("deafen", "Server-deafen a member.", "voice", False),
+        ("undeafen", "Un-deafen a member.", "voice", False),
+        ("disconnect", "Disconnect from voice.", "voice", False),
+        ("move", "Move to a voice channel.", "voice", False),
+        # info
+        ("ping", "Bot gateway latency.", "info", False),
+        ("uptime", "Bot uptime.", "info", False),
+        ("serverinfo", "Info about this server.", "info", False),
+        ("userinfo", "Info about a member.", "info", False),
+        ("avatar", "Show a user's avatar.", "info", False),
+        ("membercount", "Total members.", "info", False),
+        ("invites", "List active invites.", "info", False),
+        # utility
+        ("say", "Bot posts a message.", "utility", False),
+        ("embed", "Post an embed.", "utility", False),
+        ("poll", "Create a yes/no poll.", "utility", False),
+        ("remind", "DM a reminder after a duration.", "utility", False),
+        # emoji
+        ("addemoji", "Add a custom emoji from URL.", "emoji", False),
+        ("deleteemoji", "Delete a custom emoji.", "emoji", False),
+        # config
+        ("setmodlog", "Set the mod log channel.", "config", False),
+        ("modlog", "Show mod log channel.", "config", False),
+        ("autorole", "Set a role auto-added to new members.", "config", False),
+        ("welcome", "Set a welcome channel.", "config", False),
+    ]
     return {
         "commands": [
-            {"name": "wipe", "description": "Delete every channel in this server.", "category": "moderation", "destructive": True, "status": "active"},
-            {"name": "ban", "description": "Ban a member.", "category": "moderation", "status": "planned"},
-            {"name": "kick", "description": "Kick a member.", "category": "moderation", "status": "planned"},
-            {"name": "mute", "description": "Timeout a member.", "category": "moderation", "status": "planned"},
-            {"name": "unmute", "description": "Remove a timeout.", "category": "moderation", "status": "planned"},
-            {"name": "warn", "description": "Warn a member.", "category": "moderation", "status": "planned"},
-            {"name": "purge", "description": "Bulk delete messages.", "category": "moderation", "status": "planned"},
-            {"name": "lockdown", "description": "Lock a channel.", "category": "moderation", "status": "planned"},
+            {
+                "name": n,
+                "description": d,
+                "category": cat,
+                "destructive": destr,
+                "status": "active",
+            } for (n, d, cat, destr) in cmds
         ]
     }
 
