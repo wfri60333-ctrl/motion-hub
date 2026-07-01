@@ -101,6 +101,8 @@ def _push_log(line: str):
         "line": line.rstrip(),
     }
     LOG_BUFFER.append(entry)
+    # Also emit to stdout so it shows up in Render/Docker logs
+    print(f"[bot] {entry['line']}", flush=True)
     try:
         with open(BOT_LOG_FILE, "a") as f:
             f.write(f"[{entry['ts']}] {entry['line']}\n")
