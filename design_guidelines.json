@@ -1,0 +1,68 @@
+{
+  "app_type": "dashboard",
+  "theme": "Dark",
+  "archetype": "Archetype 2: The Performance Pro (Tactical Command Center)",
+  "typography": {
+    "primary_font": "Chivo",
+    "body_font": "Inter",
+    "mono_font": "JetBrains Mono",
+    "hierarchy": {
+      "h1": "text-3xl sm:text-4xl font-black tracking-tighter uppercase text-white",
+      "h2": "text-xl sm:text-2xl font-bold tracking-tight text-white/90",
+      "h3": "text-lg font-semibold tracking-tight text-white/80",
+      "body": "text-sm sm:text-base font-normal leading-relaxed text-white/70",
+      "console": "text-xs sm:text-sm font-mono text-emerald-400 leading-tight tracking-tight",
+      "overline": "text-[10px] sm:text-xs font-bold uppercase tracking-[0.2em] text-white/50"
+    }
+  },
+  "colors": {
+    "background": "#050505",
+    "surface": "#0A0A0A",
+    "surface_elevated": "#141414",
+    "border": "rgba(255, 255, 255, 0.1)",
+    "border_active": "rgba(255, 255, 255, 0.25)",
+    "primary": "#007AFF",
+    "primary_hover": "#3395FF",
+    "destructive": "#FF3B30",
+    "destructive_hover": "#FF6961",
+    "success": "#34C759",
+    "warning": "#FFCC00",
+    "text_main": "#FFFFFF",
+    "text_muted": "rgba(255, 255, 255, 0.5)"
+  },
+  "layout": {
+    "spacing_system": "Dense and structural. Use tight gaps (gap-4, gap-6). Container padding should be precise (p-4 or p-6).",
+    "grid_pattern": "MODE B: THE CONTROL ROOM GRID. Density, data correlation, scanability. Main layout uses a strict side-nav + main content area. Dashboard internal panels should snap into a rigid 12-column CSS grid with `col-span` sizing.",
+    "surfaces": "GRID BORDERS (The Technical Look). Expose the skeleton. Sharp edges, 1px solid strokes for definition, zero soft shadows. Use `border-white/10` heavily.",
+    "border_radius": "rounded-none or max rounded-sm (2px) to maintain the sharp tactical feel."
+  },
+  "components": {
+    "buttons": "Sharp corners (`rounded-none`). 1px solid border. Hover state should be instantaneous (75ms). Primary CTA (Start Bot) uses solid success color or pure white text on primary background. Destructive (Wipe) uses highly visible red.",
+    "console_window": "Must use 'JetBrains Mono' or similar. Black background (`bg-[#000000]`), glowing green or white text. Must have a custom thin scrollbar. Requires `overflow-y-auto` and `h-full` to fit grid cells seamlessly.",
+    "cards": "Go cardless or use pure flat rectangular surfaces (`bg-[#0A0A0A]`). 1px subtle border (`border-white/10`), NO box-shadow. On hover: border brightens slightly, no Y-axis lift.",
+    "navigation": "Vertical left sidebar for desktop. Grid item styles with border-b/border-r. Active state gets a 2px left-border of the primary color and slightly brightened text.",
+    "tables": "Dense rows. Small text (`text-sm`). 1px bottom borders per row (`border-white/5`). Hovering over a row adds subtle `bg-white/5`."
+  },
+  "motion": {
+    "hover": "Instant or very fast (75ms). Tactical UI must feel like hardware, instantaneous and precise. Avoid floaty/bouncy animations.",
+    "transitions": "Only opacity and background-color. Avoid complex layout shifts or scaling (no bouncing)."
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "Technical, sharp. Use 16px (w-4 h-4) or 20px (w-5 h-5) sizes max for dense technical look."
+  },
+  "media_urls": {
+    "logo": "none required, implement a text-based ASCII or terminal prompt logo (e.g., `>_ MOD_CTRL`) to reinforce the tech aesthetic.",
+    "background_textures": "none required, rely on the dark minimal CSS colors and strict border layout."
+  },
+  "instructions_to_main_agent": [
+    "1. DO NOT use generic soft SaaS dashboard templates. This must look like a mission control center. Sharp edges, high contrast, rigid grid-based borders.",
+    "2. All interactive and key informational elements MUST include a `data-testid` attribute (e.g., `data-testid='start-bot-button'`, `data-testid='wipe-channels-btn'`).",
+    "3. Ensure the Console Log Stream window is vertically scrollable, uses JetBrains Mono font, and mimics a real raw terminal output.",
+    "4. Incorporate a master 'Start/Stop Bot' toggle or big button prominently in the header or top right corner with a live status indicator (pulsing green dot for online).",
+    "5. The 'Wipe Channels' button MUST be treated as a highly destructive action: use Archetype 2's Electric Blaze (#FF3B30). It should ideally trigger a Shadcn Modal/Dialog for explicit confirmation.",
+    "6. Construct layout using pure HTML+Tailwind for the main structural grid, but heavily customize Shadcn primitives (strip their radiuses, strip shadows, enforce hard 1px borders) for interactive elements like Tables, Dialogs, and Selects.",
+    "7. Ensure responsive behavior: On mobile, the sidebar becomes a sticky bottom or top header, and the console window shrinks gracefully but remains legible.",
+    "8. Inject 'Chivo', 'Inter', and 'JetBrains Mono' via Google Fonts in index.html. DO NOT use .tsx, ensure everything is standard React .jsx/.js as this project uses JavaScript."
+  ]
+}
