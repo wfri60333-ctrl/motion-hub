@@ -12,7 +12,6 @@ const CATEGORY_ORDER = [
   "utility",
   "config",
   "emoji",
-  "luarmor",
 ];
 
 export default function CommandsPage() {

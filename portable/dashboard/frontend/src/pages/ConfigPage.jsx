@@ -8,7 +8,7 @@ export default function ConfigPage() {
   const [token, setToken] = useState("");
   const [appId, setAppId] = useState("");
   const [roles, setRoles] = useState("");
-  const [luarmorKey, setLuarmorKey] = useState("");
+  const [luaobfKey, setLuaobfKey] = useState("");
   const [saving, setSaving] = useState(false);
 
   const load = async () => {
@@ -33,11 +33,11 @@ export default function ConfigPage() {
           .filter(Boolean),
       };
       if (token.trim()) payload.bot_token = token.trim();
-      if (luarmorKey.trim()) payload.luarmor_api_key = luarmorKey.trim();
+      if (luaobfKey.trim()) payload.luaobfuscator_api_key = luaobfKey.trim();
       await botApi.updateConfig(payload);
       toast.success("Configuration saved");
       setToken("");
-      setLuarmorKey("");
+      setLuaobfKey("");
       await load();
     } catch (e) {
       toast.error("Failed to save configuration");
@@ -127,20 +127,19 @@ export default function ConfigPage() {
 
           <Field
             icon={Shield}
-            label="Luarmor API Key"
-            hint="Your Luarmor project API key. Enables /lm-setpanel, /lm-whitelist, /lm-resethwid, and the interactive script panel."
+            label="LuaObfuscator API Key (optional)"
+            hint="Optional. If you sign up at luaobfuscator.com for a free key, MOD_CTRL uses their professional obfuscation engine instead of the built-in one. Leave blank to use the built-in obfuscator (fully self-contained, no external dependency)."
           >
             <input
-              data-testid="config-luarmor-input"
+              data-testid="config-luaobf-input"
               type="password"
-              value={luarmorKey}
-              onChange={(e) => setLuarmorKey(e.target.value)}
-              placeholder={config?.luarmor_api_key_set ? config.luarmor_api_key_masked : "paste luarmor API key"}
+              value={luaobfKey}
+              onChange={(e) => setLuaobfKey(e.target.value)}
+              placeholder={config?.luaobfuscator_api_key_set ? config.luaobfuscator_api_key_masked : "leave blank for built-in obfuscator"}
               className="w-full bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2.5 font-mono text-sm text-white placeholder:text-white/25"
             />
             <div className="text-[10px] mt-1.5 uppercase tracking-widest text-white/40">
-              Current: {config?.luarmor_api_key_set ? "loaded" : "not set"} · Get one from{" "}
-              <a href="https://luarmor.net" target="_blank" rel="noreferrer" className="underline text-white">luarmor.net</a>
+              Current: {config?.luaobfuscator_api_key_set ? "external engine" : "built-in engine (recommended)"}
             </div>
           </Field>
 

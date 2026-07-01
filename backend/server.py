@@ -60,7 +60,6 @@ class BotConfigUpdate(BaseModel):
     bot_token: Optional[str] = None
     application_id: Optional[str] = None
     allowed_role_ids: Optional[List[str]] = None
-    luarmor_api_key: Optional[str] = None
     luaobfuscator_api_key: Optional[str] = None
 
 
@@ -147,12 +146,6 @@ async def get_config():
     )
     doc["bot_token_set"] = bool(token)
     doc.pop("bot_token", None)
-    lm = doc.get("luarmor_api_key") or ""
-    doc["luarmor_api_key_masked"] = (
-        (lm[:4] + "•" * 8 + lm[-4:]) if len(lm) > 8 else ("•" * len(lm))
-    )
-    doc["luarmor_api_key_set"] = bool(lm)
-    doc.pop("luarmor_api_key", None)
     lo = doc.get("luaobfuscator_api_key") or ""
     doc["luaobfuscator_api_key_masked"] = (
         (lo[:4] + "•" * 8 + lo[-4:]) if len(lo) > 8 else ("•" * len(lo))
@@ -172,8 +165,6 @@ async def update_config(payload: BotConfigUpdate):
         updates["application_id"] = payload.application_id.strip()
     if payload.allowed_role_ids is not None:
         updates["allowed_role_ids"] = [r.strip() for r in payload.allowed_role_ids if r.strip()]
-    if payload.luarmor_api_key is not None:
-        updates["luarmor_api_key"] = payload.luarmor_api_key.strip()
     if payload.luaobfuscator_api_key is not None:
         updates["luaobfuscator_api_key"] = payload.luaobfuscator_api_key.strip()
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -212,7 +203,6 @@ async def bot_start():
     env["DISCORD_BOT_TOKEN"] = token
     env["DISCORD_APP_ID"] = cfg.get("application_id", "") or env.get("DISCORD_APP_ID", "")
     env["ALLOWED_ROLE_IDS"] = ",".join(cfg.get("allowed_role_ids") or [])
-    env["LUARMOR_API_KEY"] = (cfg.get("luarmor_api_key") or env.get("LUARMOR_API_KEY", "") or "")
     env["BOT_API_URL"] = os.environ.get("BOT_API_URL", "http://localhost:8001")
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -342,12 +332,6 @@ async def list_commands():
         ("modlog", "Show mod log channel.", "config", False),
         ("autorole", "Set a role auto-added to new members.", "config", False),
         ("welcome", "Set a welcome channel.", "config", False),
-        # luarmor
-        ("lm-setpanel", "Create a Luarmor script panel (Redeem Key / Get Script / Reset HWID).", "luarmor", False),
-        ("lm-whitelist", "Whitelist a Discord user in Luarmor.", "luarmor", False),
-        ("lm-blacklist", "Blacklist a Luarmor key.", "luarmor", True),
-        ("lm-resethwid", "Force reset HWID for a Luarmor key.", "luarmor", False),
-        ("lm-keyinfo", "Look up details of a Luarmor key.", "luarmor", False),
     ]
     return {
         "commands": [
