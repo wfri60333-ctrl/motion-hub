@@ -14,7 +14,8 @@ services:
         value: "1521654504045543578"
       - key: LUA_BIN
         value: lua5.3
-      # Fill these in Render dashboard AFTER deploy (they contain secrets)
+      # Fill these in the Render dashboard AFTER deploy (they contain secrets)
+      # MONGO_URL should be your Atlas connection string, same one used by the preview
       - key: MONGO_URL
         sync: false
       - key: DISCORD_BOT_TOKEN
