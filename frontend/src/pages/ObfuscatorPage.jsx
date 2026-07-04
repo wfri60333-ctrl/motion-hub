@@ -3,17 +3,12 @@ import { api } from "@/lib/botApi";
 import { toast } from "sonner";
 import { Sparkles, Copy, Download, Save, Loader2, Zap, Shield, Flame } from "lucide-react";
 
-const SAMPLE = `-- paste your Lua script here
-print("hello world")
-local function greet(name)
-    return "hi " .. name
-end
-print(greet("nxtro"))`;
+const SAMPLE = "";
 
 const LEVELS = [
-  { id: "light", label: "Light", icon: Zap, tag: "1 layer · strings", tone: "text-white" },
-  { id: "medium", label: "Medium", icon: Shield, tag: "2 layers · strings + numbers", tone: "text-[#3395FF]" },
-  { id: "heavy", label: "Heavy", icon: Flame, tag: "3 layers · anti-hook + junk", tone: "text-[#FF6961]" },
+  { id: "light", label: "Light", icon: Zap, tag: "Prometheus Weak preset", tone: "text-white" },
+  { id: "medium", label: "Medium", icon: Shield, tag: "Prometheus Medium (VM + strings)", tone: "text-[#3395FF]" },
+  { id: "heavy", label: "Heavy", icon: Flame, tag: "Prometheus Strong (VM + CFG + junk)", tone: "text-[#FF6961]" },
 ];
 
 export default function ObfuscatorPage() {

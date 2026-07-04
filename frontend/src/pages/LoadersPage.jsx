@@ -142,7 +142,7 @@ export default function LoadersPage() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-2 p-4 border-b border-white/10">
               <UrlMode
                 title="MENU MODE"
-                subtitle="Yuna:load('aimbot')"
+                subtitle="Loader:load('slug')"
                 url={`${backendUrl}/api/loader/${L.id}.lua`}
                 onCopy={copyUrl}
               />

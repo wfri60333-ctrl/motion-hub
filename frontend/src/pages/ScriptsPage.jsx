@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/botApi";
 import { toast } from "sonner";
-import { Copy, Download, Trash2, FileCode } from "lucide-react";
+import { Copy, Download, Trash2, FileCode, Power, PowerOff } from "lucide-react";
 
 export default function ScriptsPage() {
   const [rows, setRows] = useState([]);
@@ -17,9 +17,7 @@ export default function ScriptsPage() {
     }
   };
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
   const download = async (id, name, level) => {
     const r = await api.get(`/scripts/${id}`);
@@ -42,6 +40,13 @@ export default function ScriptsPage() {
     if (!window.confirm("Delete this script?")) return;
     await api.delete(`/scripts/${id}`);
     toast.success("Deleted");
+    await load();
+  };
+
+  const toggle = async (s) => {
+    const next = !(s.enabled !== false);
+    await api.post(`/scripts/${s.id}/toggle`, { enabled: next });
+    toast.success(next ? "Enabled — script is live" : "🛑 Kill switch ON — no verify succeeds until re-enabled");
     await load();
   };
 
@@ -86,7 +91,8 @@ export default function ScriptsPage() {
               >
                 <div className="flex items-center gap-2 min-w-0">
                   <FileCode className="w-3.5 h-3.5 text-white/40 shrink-0" />
-                  <span className="text-white truncate">{s.name}</span>
+                  <span className={`truncate ${s.enabled === false ? "text-white/40 line-through" : "text-white"}`}>{s.name}</span>
+                  {s.enabled === false && <span className="text-[9px] font-bold text-[#FF6961] uppercase tracking-widest">KILL</span>}
                 </div>
                 <span
                   className={`font-mono uppercase text-[10px] ${
@@ -98,6 +104,18 @@ export default function ScriptsPage() {
                 <span className="font-mono text-white/50 text-right">{s.output_bytes}b</span>
                 <span className="text-white/50 font-mono">{ts.toLocaleDateString()}</span>
                 <div className="flex items-center gap-1 justify-end">
+                  <button
+                    onClick={() => toggle(s)}
+                    className={`p-1.5 border transition-colors duration-75 ${
+                      s.enabled === false
+                        ? "border-[#FF3B30]/50 text-[#FF6961]"
+                        : "border-white/10 hover:border-[#34C759]/40 text-white/60 hover:text-[#34C759]"
+                    }`}
+                    title={s.enabled === false ? "Kill switch ON — click to re-enable" : "Kill switch — click to disable"}
+                    data-testid={`script-toggle-${s.id}`}
+                  >
+                    {s.enabled === false ? <PowerOff className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" />}
+                  </button>
                   <button
                     onClick={() => copy(s.id)}
                     className="p-1.5 border border-white/10 hover:border-white/30 text-white/60 hover:text-white transition-colors duration-75"

@@ -495,6 +495,65 @@ async def delete_script(script_id: str):
     return {"ok": True, "deleted": r.deleted_count}
 
 
+# ============= KILL SWITCH (Luarmor-style disable/enable) =============
+class ToggleRequest(BaseModel):
+    enabled: bool
+
+
+@api_router.post("/scripts/{script_id}/toggle")
+async def toggle_script(script_id: str, payload: ToggleRequest):
+    """Kill-switch a script. When enabled=false, /api/verify returns 'ERROR: script disabled' regardless of key."""
+    r = await db.scripts.update_one(
+        {"id": script_id},
+        {"$set": {"enabled": bool(payload.enabled)}},
+    )
+    return {"ok": True, "modified": r.modified_count, "enabled": bool(payload.enabled)}
+
+
+@api_router.post("/loaders/{loader_id}/toggle")
+async def toggle_loader(loader_id: str, payload: ToggleRequest):
+    r = await db.loaders.update_one(
+        {"id": loader_id},
+        {"$set": {"enabled": bool(payload.enabled)}},
+    )
+    return {"ok": True, "modified": r.modified_count, "enabled": bool(payload.enabled)}
+
+
+# ============= KEY CHECK API (Luarmor-style pre-execution metadata) =============
+@api_router.get("/checkkey")
+async def check_key(key: str = ""):
+    """Return non-sensitive metadata about a key BEFORE running the obfuscated body.
+    Used by Lua scripts to check status/expiry/discord id without executing.
+    """
+    if not key:
+        raise HTTPException(status_code=400, detail="missing key")
+    row = await db.wl_keys.find_one({"key": key}, {"_id": 0})
+    if not row:
+        return {"ok": False, "error": "invalid key"}
+    now = datetime.now(timezone.utc)
+    expired = False
+    if row.get("expires_at"):
+        try:
+            expired = datetime.fromisoformat(row["expires_at"]) < now
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "status": row.get("status", "active"),
+        "expired": expired,
+        "expires_at": row.get("expires_at"),
+        "executions": row.get("executions", 0),
+        "max_executions": row.get("max_executions"),
+        "hwid_bound": bool(row.get("hwid")),
+        "hwid_mismatch_count": row.get("hwid_mismatch_count", 0),
+        "discord_id": row.get("discord_id"),
+        "note": row.get("note"),
+        "script_name": row.get("script_name"),
+        "loader_name": row.get("loader_name"),
+        "last_used": row.get("last_used"),
+    }
+
+
 # ============= SELF-HOSTED WHITELIST (mini-Luarmor) =============
 import secrets as _secrets
 from fastapi.responses import PlainTextResponse
@@ -506,6 +565,16 @@ class KeyCreate(BaseModel):
     discord_id: Optional[str] = None
     note: Optional[str] = None
     expires_days: Optional[int] = None
+    max_executions: Optional[int] = None  # 0 or null = unlimited
+
+
+class BulkKeyCreate(BaseModel):
+    script_id: Optional[str] = None
+    loader_id: Optional[str] = None
+    count: int = 10           # how many keys to generate (1-500)
+    expires_days: Optional[int] = None
+    max_executions: Optional[int] = None
+    note: Optional[str] = None
 
 
 @api_router.post("/keys")
@@ -541,6 +610,7 @@ async def create_key(payload: KeyCreate):
         "hwid": None,
         "status": "active",
         "executions": 0,
+        "max_executions": int(payload.max_executions) if payload.max_executions else None,
         "created_at": now.isoformat(),
         "expires_at": expires_at,
         "last_used": None,
@@ -548,6 +618,52 @@ async def create_key(payload: KeyCreate):
     await db.wl_keys.insert_one(doc)
     doc.pop("_id", None)
     return {"ok": True, "key": doc}
+
+
+@api_router.post("/keys/bulk")
+async def create_keys_bulk(payload: BulkKeyCreate):
+    """Mass-generate keys for a script/loader (Luarmor-style "key stocking").
+    Returns a list of plain key strings that you can export to a text file.
+    """
+    if not payload.script_id and not payload.loader_id:
+        raise HTTPException(status_code=400, detail="Provide either script_id or loader_id")
+    n = max(1, min(500, int(payload.count)))
+    script_name = loader_name = None
+    if payload.loader_id:
+        loader = await db.loaders.find_one({"id": payload.loader_id}, {"_id": 0})
+        if not loader:
+            raise HTTPException(status_code=404, detail="Loader not found")
+        loader_name = loader.get("name")
+    if payload.script_id:
+        script = await db.scripts.find_one({"id": payload.script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
+        if not script:
+            raise HTTPException(status_code=404, detail="Script not found")
+        script_name = script.get("name")
+    now = datetime.now(timezone.utc)
+    expires_at = None
+    if payload.expires_days and payload.expires_days > 0:
+        expires_at = (now + timedelta(days=int(payload.expires_days))).isoformat()
+    docs = []
+    for _ in range(n):
+        docs.append({
+            "id": str(uuid.uuid4()),
+            "key": _secrets.token_urlsafe(24),
+            "script_id": payload.script_id or None,
+            "script_name": script_name,
+            "loader_id": payload.loader_id or None,
+            "loader_name": loader_name,
+            "discord_id": None,
+            "note": payload.note or "bulk",
+            "hwid": None,
+            "status": "active",
+            "executions": 0,
+            "max_executions": int(payload.max_executions) if payload.max_executions else None,
+            "created_at": now.isoformat(),
+            "expires_at": expires_at,
+            "last_used": None,
+        })
+    await db.wl_keys.insert_many(docs)
+    return {"ok": True, "count": len(docs), "keys": [d["key"] for d in docs]}
 
 
 @api_router.get("/keys")
@@ -932,6 +1048,20 @@ async def verify_key(request: Request, script_id: Optional[str] = None, loader_i
     if row.get("status") != "active":
         await _log_event("verify_key_not_active", row, {"status": row.get("status")})
         return f"ERROR: key is {row.get('status', 'not active')}"
+    # Kill-switch check on the target script or loader
+    if row.get("loader_id"):
+        loader_doc = await db.loaders.find_one({"id": row["loader_id"]}, {"_id": 0, "enabled": 1})
+        if loader_doc and loader_doc.get("enabled") is False:
+            await _log_event("verify_loader_disabled", row)
+            return "ERROR: this script is currently disabled"
+    if target and target.get("enabled") is False:
+        await _log_event("verify_script_disabled", row)
+        return "ERROR: this script is currently disabled"
+    # Execution cap check
+    max_exec = row.get("max_executions")
+    if max_exec and int(row.get("executions", 0)) >= int(max_exec):
+        await _log_event("verify_execution_cap", row, {"executions": row.get("executions"), "cap": max_exec})
+        return "ERROR: execution cap reached for this key"
     exp = row.get("expires_at")
     if exp:
         try:

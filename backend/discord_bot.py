@@ -1212,6 +1212,61 @@ async def deleteemoji_cmd(interaction: discord.Interaction, name: str):
     await _reply(interaction, _ok(f"Deleted `:{name}:`"))
 
 
+# ============= AUTOCOMPLETE HELPERS =============
+async def target_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete for target_id: shows loaders + standalone scripts.
+    Discord slash-command dropdown, max 25 items."""
+    cur = (current or "").lower()
+    choices = []
+    try:
+        async for l in db.loaders.find({}, {"_id": 0, "id": 1, "name": 1}).sort("created_at", -1).limit(25):
+            name = (l.get("name") or "?")
+            if not cur or cur in name.lower() or cur in (l.get("id") or ""):
+                label = f"📦 {name} — loader"[:100]
+                choices.append(app_commands.Choice(name=label, value=l["id"]))
+        # Standalone scripts (no loader attached)
+        async for s in db.scripts.find(
+            {"$or": [{"loader_id": None}, {"loader_id": {"$exists": False}}]},
+            {"_id": 0, "id": 1, "name": 1, "level": 1},
+        ).sort("created_at", -1).limit(25):
+            name = s.get("name") or "?"
+            if not cur or cur in name.lower() or cur in (s.get("id") or ""):
+                label = f"📄 {name} — script ({s.get('level','?')})"[:100]
+                choices.append(app_commands.Choice(name=label, value=s["id"]))
+    except Exception as e:
+        _log(f"[autocomplete target] {e}")
+    return choices[:25]
+
+
+async def key_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete for a whitelist-key string. Shows keys matching input (last-8, discord id, or note)."""
+    cur = (current or "").strip().lower()
+    choices = []
+    try:
+        q = {}
+        if cur:
+            q = {"$or": [
+                {"key": {"$regex": cur, "$options": "i"}},
+                {"discord_id": cur},
+                {"note": {"$regex": cur, "$options": "i"}},
+                {"script_name": {"$regex": cur, "$options": "i"}},
+                {"loader_name": {"$regex": cur, "$options": "i"}},
+            ]}
+        async for k in db.wl_keys.find(q, {"_id": 0}).sort("created_at", -1).limit(25):
+            scope = k.get("loader_name") or k.get("script_name") or "?"
+            key = k.get("key") or ""
+            preview = f"{key[:6]}…{key[-4:]}" if len(key) > 12 else key
+            note = (k.get("note") or "")[:20]
+            label = f"{preview} — {scope}"
+            if note: label += f" · {note}"
+            if k.get("status") == "locked": label = f"🔒 {label}"
+            label = label[:100]
+            choices.append(app_commands.Choice(name=label, value=key))
+    except Exception as e:
+        _log(f"[autocomplete key] {e}")
+    return choices[:25]
+
+
 # ============= SCRIPT PROTECTION (MOD_CTRL native) =============
 # These commands use YOUR local database (wl_keys / scripts / mc_panels collections).
 # No external service, no affiliation with anyone.
@@ -1553,6 +1608,11 @@ async def panel_cmd(interaction: discord.Interaction, display_name: str,
     _log(f"[panel] created: guild={interaction.guild.id} kind={kind} target={target_id}")
 
 
+@panel_cmd.autocomplete("target_id")
+async def _ac_panel_target(interaction, current):
+    return await target_autocomplete(interaction, current)
+
+
 @tree.command(name="whitelist", description="Whitelist a user for a script/loader and grant them a role. No key is DM'd.")
 @app_commands.describe(
     user="Discord user to whitelist",
@@ -1647,7 +1707,13 @@ async def whitelist_cmd(interaction: discord.Interaction, user: discord.Member,
     })
 
 
+@whitelist_cmd.autocomplete("target_id")
+async def _ac_whitelist_target(interaction, current):
+    return await target_autocomplete(interaction, current)
+
+
 @tree.command(name="revoke", description="Revoke a key (immediate).")
+@app_commands.describe(user_key="The whitelist key to revoke")
 @guild_only()
 @needs_auth()
 async def revoke_cmd(interaction: discord.Interaction, user_key: str):
@@ -1656,6 +1722,11 @@ async def revoke_cmd(interaction: discord.Interaction, user_key: str):
         await _reply(interaction, _ok("Key revoked."))
     else:
         await _reply(interaction, _err("Key not found."))
+
+
+@revoke_cmd.autocomplete("user_key")
+async def _ac_revoke_key(interaction, current):
+    return await key_autocomplete(interaction, current)
 
 
 @tree.command(name="resethwid", description="Force-reset HWID for a key (admin — bypasses cooldown & unlocks).")
@@ -1687,12 +1758,22 @@ async def resethwid_cmd(interaction: discord.Interaction, user_key: str):
     await _reply(interaction, _ok(f"Force-reset HWID for key. Cooldown cleared, mismatch counter zeroed, key unlocked."))
 
 
+@resethwid_cmd.autocomplete("user_key")
+async def _ac_reset_key(interaction, current):
+    return await key_autocomplete(interaction, current)
+
+
 @tree.command(name="forceresethwid", description="Alias of /resethwid — force-reset a user's HWID and unlock.")
 @app_commands.describe(user_key="The whitelist key to reset")
 @guild_only()
 @needs_auth()
 async def forceresethwid_cmd(interaction: discord.Interaction, user_key: str):
     await resethwid_cmd.callback(interaction, user_key)
+
+
+@forceresethwid_cmd.autocomplete("user_key")
+async def _ac_force_reset_key(interaction, current):
+    return await key_autocomplete(interaction, current)
 
 
 @tree.command(name="unlockkey", description="Unlock a key that got auto-locked from HWID mismatches.")
@@ -1718,6 +1799,11 @@ async def unlockkey_cmd(interaction: discord.Interaction, user_key: str):
         await _reply(interaction, _ok("Key unlocked."))
     else:
         await _reply(interaction, _err("Key not found."))
+
+
+@unlockkey_cmd.autocomplete("user_key")
+async def _ac_unlock_key(interaction, current):
+    return await key_autocomplete(interaction, current)
 
 
 @tree.command(name="perms", description="View or set per-category role permissions for this bot.")
@@ -1783,8 +1869,12 @@ async def keyinfo_cmd(interaction: discord.Interaction, user_key: str):
     e.add_field(name="Mismatches", value=str(row.get("hwid_mismatch_count", 0)))
     e.add_field(name="Expires", value=str(row.get("expires_at") or "never"))
     e.add_field(name="Last used", value=str(row.get("last_used") or "never"))
-    e.add_field(name="Note", value=str(row.get("note") or "—"), inline=False)
     await _reply(interaction, "", embed=e, ephemeral=False)
+
+
+@keyinfo_cmd.autocomplete("user_key")
+async def _ac_keyinfo_key(interaction, current):
+    return await key_autocomplete(interaction, current)
 
 
 @tree.command(name="obfuscate", description="Obfuscate an attached .lua file.")

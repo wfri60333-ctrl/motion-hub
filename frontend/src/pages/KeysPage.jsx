@@ -9,7 +9,7 @@ export default function KeysPage() {
   const [loaders, setLoaders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [form, setForm] = useState({ target: "", discord_id: "", note: "", expires_days: 0 });
+  const [form, setForm] = useState({ target: "", discord_id: "", note: "", expires_days: 0, max_executions: 0, bulk_count: 10 });
   const [backendUrl] = useState(process.env.REACT_APP_BACKEND_URL);
 
   const load = async () => {
@@ -42,16 +42,49 @@ export default function KeysPage() {
         discord_id: form.discord_id || null,
         note: form.note || null,
         expires_days: form.expires_days ? Number(form.expires_days) : null,
+        max_executions: form.max_executions ? Number(form.max_executions) : null,
       };
       if (kind === "loader") body.loader_id = id; else body.script_id = id;
       const r = await api.post("/keys", body);
       toast.success("Key created");
       await navigator.clipboard.writeText(r.data.key.key);
       toast.success("Key copied to clipboard");
-      setForm({ target: form.target, discord_id: "", note: "", expires_days: 0 });
+      setForm({ ...form, discord_id: "", note: "" });
       await load();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Failed to create key");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const bulkCreate = async () => {
+    if (!form.target) { toast.error("Pick a script or loader"); return; }
+    const count = Number(form.bulk_count) || 10;
+    if (count < 1 || count > 500) { toast.error("count must be 1-500"); return; }
+    const [kind, id] = form.target.split(":", 2);
+    setCreating(true);
+    try {
+      const body = {
+        count,
+        expires_days: form.expires_days ? Number(form.expires_days) : null,
+        max_executions: form.max_executions ? Number(form.max_executions) : null,
+        note: form.note || "bulk",
+      };
+      if (kind === "loader") body.loader_id = id; else body.script_id = id;
+      const r = await api.post("/keys/bulk", body);
+      const list = (r.data.keys || []).join("\n");
+      const blob = new Blob([list], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `keys-${count}-${Date.now()}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success(`Generated ${r.data.count} keys — downloaded as .txt`);
+      await load();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Bulk create failed");
     } finally {
       setCreating(false);
     }
@@ -160,6 +193,28 @@ export default function KeysPage() {
             className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30"
           />
         </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          <input
+            data-testid="key-max-exec"
+            type="number"
+            min="0"
+            value={form.max_executions}
+            onChange={(e) => setForm({ ...form, max_executions: e.target.value })}
+            placeholder="max executions (0 = unlimited)"
+            className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30"
+          />
+          <input
+            data-testid="key-bulk-count"
+            type="number"
+            min="1"
+            max="500"
+            value={form.bulk_count}
+            onChange={(e) => setForm({ ...form, bulk_count: e.target.value })}
+            placeholder="bulk generate: how many keys (1-500)"
+            className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30"
+          />
+        </div>
+        <div className="flex flex-wrap gap-2">
         <button
           data-testid="key-create"
           onClick={create}
@@ -169,6 +224,16 @@ export default function KeysPage() {
           {creating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
           Generate Key
         </button>
+        <button
+          data-testid="key-bulk-create"
+          onClick={bulkCreate}
+          disabled={creating}
+          className="inline-flex items-center gap-2 border border-[#3395FF] bg-[#3395FF]/10 hover:bg-[#3395FF]/20 text-[#3395FF] px-4 py-2 text-xs uppercase tracking-[0.2em] font-bold transition-colors duration-75 disabled:opacity-50"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          Bulk Generate ({form.bulk_count || 10})
+        </button>
+        </div>
       </div>
 
       {/* Table */}
