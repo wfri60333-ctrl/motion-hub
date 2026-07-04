@@ -83,6 +83,27 @@ export default function Overview() {
         </div>
       )}
 
+      {status?.mongo_is_local && (
+        <div
+          data-testid="warning-local-mongo"
+          className="border border-[#FF6961]/50 bg-[#FF3B30]/[0.08] p-4 flex items-start gap-3"
+        >
+          <AlertTriangle className="w-4 h-4 text-[#FF6961] mt-0.5 shrink-0" />
+          <div className="flex-1 text-sm">
+            <div className="text-[#FF6961] uppercase tracking-widest text-[10px] font-bold">
+              Dashboard is using a LOCAL database
+            </div>
+            <div className="text-white/70 mt-1">
+              Current DB host: <span className="font-mono text-white">{status.mongo_host}</span> · database: <span className="font-mono text-white">{status.db_name}</span>
+              <br />
+              <span className="text-white/50">
+                This DB lives inside the preview container. Anything you create here <b>will NOT be visible to a Discord bot deployed on Render or bot-hosting.net</b>, and it will reset when the preview container rebuilds. To make everything persistent AND shared with your production bot, point both to the same MongoDB Atlas cluster (free tier: cloud.mongodb.com).
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* KPI Grid */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <Kpi

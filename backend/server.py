@@ -223,12 +223,27 @@ async def bot_status():
     uptime = None
     if running and BOT_STARTED_AT:
         uptime = (datetime.now(timezone.utc) - BOT_STARTED_AT).total_seconds()
+    # Redact credentials from MONGO_URL, keep only host+db for the dashboard indicator
+    raw = os.environ.get("MONGO_URL", "")
+    mongo_display = "unknown"
+    is_local = False
+    try:
+        # strip user:pass@ then keep host portion
+        tail = raw.split("@")[-1] if "@" in raw else raw.replace("mongodb://", "").replace("mongodb+srv://", "")
+        host = tail.split("/")[0]
+        mongo_display = host
+        is_local = ("localhost" in host) or ("127.0.0.1" in host) or host.startswith("mongodb:")
+    except Exception:
+        pass
     return {
         "running": running,
         "pid": BOT_PROCESS.pid if running else None,
         "uptime_seconds": uptime,
         "runtime": BOT_RUNTIME,
         "started_at": BOT_STARTED_AT.isoformat() if BOT_STARTED_AT else None,
+        "mongo_host": mongo_display,
+        "mongo_is_local": is_local,
+        "db_name": os.environ.get("DB_NAME", ""),
     }
 
 
@@ -493,6 +508,65 @@ async def save_script(payload: SavedScriptCreate):
 async def delete_script(script_id: str):
     r = await db.scripts.delete_one({"id": script_id})
     return {"ok": True, "deleted": r.deleted_count}
+
+
+class ScriptUpdate(BaseModel):
+    name: Optional[str] = None
+    source: Optional[str] = None
+    level: Optional[str] = None  # light | medium | heavy
+    slug: Optional[str] = None
+    note: Optional[str] = None
+
+
+@api_router.put("/scripts/{script_id}")
+async def update_script(script_id: str, payload: ScriptUpdate):
+    """Edit a script. If source or level changes, re-obfuscate automatically."""
+    doc = await db.scripts.find_one({"id": script_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Script not found")
+    updates = {}
+    if payload.name is not None and payload.name.strip():
+        updates["name"] = payload.name.strip()
+    if payload.note is not None:
+        updates["note"] = payload.note
+    if payload.slug is not None and payload.slug.strip() and doc.get("loader_id"):
+        new_slug = re.sub(r"[^a-zA-Z0-9_-]", "-", payload.slug.strip().lower())[:32] or "script"
+        # ensure unique inside the loader
+        clash = await db.scripts.find_one(
+            {"loader_id": doc["loader_id"], "slug": new_slug, "id": {"$ne": script_id}},
+            {"_id": 0},
+        )
+        if clash:
+            raise HTTPException(status_code=400, detail=f"Slug '{new_slug}' already used in this loader")
+        updates["slug"] = new_slug
+    new_level = (payload.level or doc.get("level") or "medium").lower()
+    if new_level not in ("light", "medium", "heavy"):
+        raise HTTPException(status_code=400, detail="Invalid level")
+    should_reobf = False
+    new_source = doc.get("source")
+    if payload.source is not None and payload.source != doc.get("source"):
+        if not payload.source.strip():
+            raise HTTPException(status_code=400, detail="Source cannot be empty")
+        new_source = payload.source
+        should_reobf = True
+    if payload.level is not None and new_level != doc.get("level"):
+        should_reobf = True
+    if should_reobf:
+        cfg = await get_or_create_config()
+        api_key = (cfg.get("luaobfuscator_api_key") or "").strip() or None
+        try:
+            obf_out, engine = await _obfuscate_lua(new_source, new_level, api_key)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Re-obfuscation failed: {e}")
+        updates["source"] = new_source
+        updates["obfuscated"] = obf_out
+        updates["level"] = new_level
+        updates["source_bytes"] = len(new_source)
+        updates["output_bytes"] = len(obf_out)
+        updates["engine"] = engine
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.scripts.update_one({"id": script_id}, {"$set": updates})
+    return {"ok": True, "reobfuscated": should_reobf, "updated": list(updates.keys())}
 
 
 # ============= KILL SWITCH (Luarmor-style disable/enable) =============

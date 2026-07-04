@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/botApi";
 import { toast } from "sonner";
-import { Plus, Trash2, Layers, Copy, X, ArrowRight, FileCode } from "lucide-react";
+import { Plus, Trash2, Layers, Copy, X, ArrowRight, FileCode, Pencil, Save, Loader2 } from "lucide-react";
 
 export default function LoadersPage() {
   const [loaders, setLoaders] = useState([]);
@@ -9,6 +9,7 @@ export default function LoadersPage() {
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ name: "", description: "" });
+  const [editing, setEditing] = useState(null); // { script_id, name, slug, level, source, note }
   const backendUrl = process.env.REACT_APP_BACKEND_URL;
 
   const load = async () => {
@@ -23,6 +24,45 @@ export default function LoadersPage() {
   };
 
   useEffect(() => { load(); }, []);
+
+  const startEdit = async (script) => {
+    // Fetch full source (list endpoint strips it)
+    try {
+      const r = await api.get(`/scripts/${script.id}`);
+      setEditing({
+        script_id: script.id,
+        name: r.data.name || script.name,
+        slug: r.data.slug || script.slug || "",
+        level: r.data.level || "medium",
+        source: r.data.source || "",
+        note: r.data.note || "",
+      });
+    } catch (e) {
+      toast.error("Could not load script source");
+    }
+  };
+
+  const saveEdit = async () => {
+    if (!editing) return;
+    const t = toast.loading("Re-obfuscating…");
+    try {
+      const body = {
+        name: editing.name,
+        slug: editing.slug,
+        level: editing.level,
+        source: editing.source,
+        note: editing.note,
+      };
+      const r = await api.put(`/scripts/${editing.script_id}`, body);
+      toast.dismiss(t);
+      toast.success(r.data.reobfuscated ? "Saved + re-obfuscated" : "Saved");
+      setEditing(null);
+      await load();
+    } catch (e) {
+      toast.dismiss(t);
+      toast.error(e?.response?.data?.detail || "Save failed");
+    }
+  };
 
   const create = async () => {
     if (!form.name.trim()) { toast.error("Name required"); return; }
@@ -169,10 +209,21 @@ export default function LoadersPage() {
                 <div className="text-xs text-white/40 py-3">No scripts attached yet.</div>
               ) : (
                 (L.scripts || []).map((s) => (
-                  <div key={s.id} className="grid grid-cols-[auto_1fr_auto_auto_auto] items-center gap-3 py-2 border-b border-white/5 text-xs">
+                  <div key={s.id} className="grid grid-cols-[auto_1fr_auto_auto_auto_auto_auto] items-center gap-3 py-2 border-b border-white/5 text-xs">
                     <FileCode className="w-3.5 h-3.5 text-white/40" />
-                    <span className="text-white truncate">{s.name}</span>
+                    <span className={`truncate ${s.enabled === false ? "text-white/40 line-through" : "text-white"}`}>{s.name}</span>
                     <span className="font-mono text-[#3395FF]">/{s.slug}</span>
+                    <span className={`font-mono text-[10px] ${
+                      s.level === "heavy" ? "text-[#FF6961]" : s.level === "medium" ? "text-[#3395FF]" : "text-white/50"
+                    }`}>{(s.level||"?").toUpperCase()}</span>
+                    <button
+                      onClick={() => startEdit(s)}
+                      className="p-1 border border-white/10 hover:border-[#3395FF]/60 hover:text-[#3395FF] text-white/60"
+                      title="Edit source + re-obfuscate"
+                      data-testid={`script-edit-${s.id}`}
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
                     <button
                       onClick={() => copyUrl(`${backendUrl}/api/loader/${L.id}/${s.slug}.lua`, "Individual")}
                       className="p-1 border border-white/10 hover:border-white/30 text-white/60 hover:text-white"
@@ -201,6 +252,97 @@ export default function LoadersPage() {
             </div>
           </div>
         ))
+      )}
+
+      {editing && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setEditing(null)}
+        >
+          <div
+            className="bg-[#0A0A0A] border border-white/15 w-full max-w-3xl max-h-[85vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+            data-testid="edit-script-modal"
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.25em] text-white/40 font-bold">
+                  EDIT SCRIPT
+                </div>
+                <div className="text-white text-sm font-mono">{editing.name}</div>
+              </div>
+              <button
+                onClick={() => setEditing(null)}
+                className="p-1.5 border border-white/10 hover:border-white/30 text-white/60 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3 overflow-y-auto tactical-scroll">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                <input
+                  value={editing.name}
+                  onChange={(e) => setEditing({ ...editing, name: e.target.value })}
+                  placeholder="script name"
+                  className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white"
+                  data-testid="edit-name"
+                />
+                <input
+                  value={editing.slug}
+                  onChange={(e) => setEditing({ ...editing, slug: e.target.value })}
+                  placeholder="slug"
+                  className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white"
+                  data-testid="edit-slug"
+                />
+                <select
+                  value={editing.level}
+                  onChange={(e) => setEditing({ ...editing, level: e.target.value })}
+                  className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white"
+                  data-testid="edit-level"
+                >
+                  <option value="light">Light</option>
+                  <option value="medium">Medium</option>
+                  <option value="heavy">Heavy</option>
+                </select>
+              </div>
+              <textarea
+                value={editing.source}
+                onChange={(e) => setEditing({ ...editing, source: e.target.value })}
+                rows={20}
+                placeholder="paste new source Lua here"
+                className="w-full bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-[11px] text-white leading-relaxed resize-y min-h-[240px]"
+                data-testid="edit-source"
+              />
+              <input
+                value={editing.note}
+                onChange={(e) => setEditing({ ...editing, note: e.target.value })}
+                placeholder="internal note (optional)"
+                className="w-full bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white"
+                data-testid="edit-note"
+              />
+              <div className="text-[10px] text-white/40">
+                Saving will re-run Prometheus obfuscation with the selected level. Every existing
+                loader / verify URL keeps working — no key or panel needs to be regenerated.
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-white/10">
+              <button
+                onClick={() => setEditing(null)}
+                className="border border-white/15 hover:border-white/40 text-white/70 hover:text-white px-3 py-1.5 text-[11px] uppercase tracking-widest font-bold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveEdit}
+                className="inline-flex items-center gap-2 border border-[#007AFF] bg-[#007AFF]/10 hover:bg-[#007AFF]/20 text-[#007AFF] px-4 py-1.5 text-[11px] uppercase tracking-widest font-bold"
+                data-testid="edit-save"
+              >
+                <Save className="w-3.5 h-3.5" />
+                Save + Re-Obfuscate
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
