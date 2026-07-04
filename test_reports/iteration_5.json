@@ -1,0 +1,56 @@
+{
+  "summary": "Iteration-5 verified: Prometheus obfuscator (PRIMARY engine via bundled /app/backend/prometheus + /usr/bin/lua5.3), HWID user cooldown + auto-lockout, unified loader flow (/api/loader/{id}.lua menu stub, /bundle.lua, /{slug}.lua individual), unified target_id for /api/keys (loader_id vs script_id), key history / global hwid feed with IPs, route ordering (POST /api/keys/user/resethwid is NOT captured by /api/keys/{key_id}/resethwid), and /api/bot/commands >= 66 commands including forceresethwid + unlockkey + perms + updated /whitelist description 'grant a role'. Built /app/backend/tests/test_iter5_prometheus_hwid_flows.py (21 pytest cases). Result: 21/21 pass in 3.13s. Live sanity: /api/obfuscate returns engine='prometheus (Weak)' / (Medium) / (Strong) for light/medium/heavy — Prometheus is DISCOVERABLE and PRIMARY. NO fallback engine string 'built-in (prometheus unavailable)' anywhere.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/verify (loader mode)",
+        "issue": "When loader_id is provided WITHOUT slug, endpoint returns 'ERROR: target script not found' after auth/HWID checks pass — misleading. Consider explicit 'ERROR: slug required for loader mode'. Non-blocking (already flagged in iter_4)."
+      },
+      {
+        "endpoint": "/api/keys/user/resethwid",
+        "issue": "Cooldown check uses datetime.fromisoformat on hwid_reset_at without timezone awareness safety. If a legacy row ever stored a naive datetime string, the elapsed comparison would raise TypeError (except ValueError catches ValueError only, not TypeError). Currently safe because writes always use datetime.now(timezone.utc).isoformat(), but the except block should also catch TypeError for robustness."
+      },
+      {
+        "endpoint": "/api/keys POST",
+        "issue": "Response body wraps the key doc under 'key' — GOOD — but the raw plaintext key is returned as key.key. Since the review notes /whitelist NO LONGER DMs a key, ensure the dashboard-side create-key UI is the only surface exposing this. HTTP layer itself is correct."
+      }
+    ]
+  },
+  "frontend_issues": { "ui_bugs": [], "integration_issues": [], "design_issues": [] },
+  "test_report_links": [
+    "/app/backend/tests/test_iter5_prometheus_hwid_flows.py",
+    "/app/test_reports/pytest/iter5_prometheus_hwid.xml"
+  ],
+  "action_items": [
+    "SHIP: Prometheus obfuscator is PRIMARY and returns engine 'prometheus (Weak|Medium|Strong)' at all three levels. lua5.3 confirmed at /usr/bin/lua5.3.",
+    "SHIP: HWID cooldown (429 on user reset within window, 200 for admin) and auto-lockout (locks after N mismatches, status='locked' in /api/keys, admin reset unlocks) both verified end-to-end.",
+    "SHIP: Route ordering is correct — POST /api/keys/user/resethwid with invalid key returns 404 {detail:'Invalid key'} (user route), NOT the admin route's 200 {'ok':false,'error':'key not found'}.",
+    "SHIP: /api/bot/commands has 67 entries including forceresethwid, unlockkey, perms; /whitelist description now says 'grant a role'.",
+    "SHIP: loader flow — /api/loader/{loader_id}.lua returns menu stub with 'Menu Loader'; /api/loader/{loader_id}/bundle.lua returns bundle with 'Bundle for loader'; /api/keys with loader_id sets loader_id and script_id=null; /api/verify?loader_id+slug returns obfuscated payload and enforces HWID.",
+    "OPTIONAL: /api/verify with loader_id but missing slug -> improve error message (return 'ERROR: slug required') instead of the generic 'target script not found'.",
+    "OPTIONAL: In user_reset_hwid, widen the except ValueError to (ValueError, TypeError) for defensive parsing of legacy hwid_reset_at rows.",
+    "PRE-EXISTING (not in this scope): bot subprocess offline due to invalid DISCORD_BOT_TOKEN in DB; AUTO_RESTART lacks exponential backoff."
+  ],
+  "critical_code_review_comments": [
+    "server.py:569-616 user_reset_hwid — correctly wraps cooldown in HTTPException(429) with human-readable 'Cooldown active. Try again in Xh Ym.'. Logs reset_blocked_cooldown event even on failure — great for audit. bind: cooldown_h==0 disables cooldown (edge-case documented via `if last_reset and cooldown_h > 0`).",
+    "server.py:944-959 verify_key HWID mismatch — locks key when new_count >= lockout (cfg.hwid_mismatch_lockout). Distinct return strings ('ERROR: HWID mismatch. Ask admin to reset.' vs 'ERROR: key is locked (too many HWID mismatches). Ask admin.') — good UX and easy for loader-side string matching.",
+    "server.py:619-643 reset_key_hwid (admin) — atomically resets hwid=None, hwid_mismatch_count=0, and unlocks (status='active' if was 'locked'). Bypasses cooldown as expected. Logs 'admin_reset' event.",
+    "server.py:918-928 verify_key key resolution — when loader_id+slug given, first resolves target script, then looks up wl_keys by {key, loader_id}; falls back to {key, script_id} for legacy per-script keys granted before loader scoping. Correct backward-compat behavior.",
+    "server.py:857-883 _menu_loader_stub — returns a Lua table with :load(slug) and :bundle() methods. base URL and loader id are f-string interpolated safely. Includes short-key guard (#script_key < 8).",
+    "server.py:659 `from datetime import timedelta` is now placed BEFORE first use at line 531 (KeyCreate.expires_days) — WAIT: /keys POST uses timedelta at line 531 but import is at 659. Because timedelta is resolved at call-time inside an async function body, this still works. Same iter_4 flag stands: hoist to top-level imports for clarity.",
+    "server.py:313-403 list_commands — 67 entries. /whitelist description explicitly reads 'Whitelist a user for a script/loader and grant a role (no key DM'd).' — matches spec.",
+    "server.py:90-119 get_or_create_config — backfills the 3 new fields (command_role_perms, hwid_reset_cooldown_hours, hwid_mismatch_lockout) into legacy docs. Excellent forward-compat handling.",
+    "server.py:191-217 update_config — sanitizes command_role_perms (stringifies keys/values, skips non-list values). Clamps cooldown/lockout to max(0, int(...)). Robust against garbage input."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter5_prometheus_hwid_flows.py (created — 21 tests, all pass)"
+  ],
+  "success_rate": { "backend": "100% (21/21)", "frontend": "n/a (skipped per request)" },
+  "test_credentials": "N/A — no auth on backend endpoints tested",
+  "seed_data_creation": "Created (LEFT IN DB per request): 1 TEST_iter5_loader (with 1 uploaded script slug='aimbot'), 3 TEST_iter5_* standalone scripts (cooldown, lockout, e2e), 4 wl_keys total (1 loader-scoped, 3 script-scoped). All prefixed 'TEST_iter5_' for easy cleanup. Bot config was set to command_role_perms={moderation:[111],protection:[222]}, hwid_reset_cooldown_hours=1, hwid_mismatch_lockout=2 (last write) — main agent may want to reset via PUT /api/bot/config to production defaults (24h / 5) before shipping.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Full iter5 pytest suite lives at /app/backend/tests/test_iter5_prometheus_hwid_flows.py — run with `python -m pytest /app/backend/tests/test_iter5_prometheus_hwid_flows.py -v`. It sets hwid_reset_cooldown_hours=1 and hwid_mismatch_lockout=2 as side-effect of the config-persist and lockout tests — remember to restore to defaults if you need production values. Previous suites still valid: test_obfuscator_pipeline.py (iter_4), test_head_support.py (iter_3), test_mod_ctrl_flows.py (iter_2). lua5.3 is confirmed installed at /usr/bin/lua5.3 (needed by Prometheus and by iter_4 luac syntax checks). Bot subprocess remains offline (invalid DISCORD_BOT_TOKEN) — this is orthogonal to the HTTP layer and does not affect any of the tests here.",
+  "rca_of_the_issue": "N/A — no active bugs found. All 21 tests pass on first execution. The 3 minor issues listed are defensive-coding suggestions, not defects."
+}

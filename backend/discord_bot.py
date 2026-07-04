@@ -1224,11 +1224,26 @@ async def _find_key(user_key: str) -> Optional[dict]:
     return await db.wl_keys.find_one({"key": user_key}, {"_id": 0})
 
 
-async def _find_key_by_discord(discord_id: str, script_id: Optional[str] = None) -> Optional[dict]:
-    q = {"discord_id": discord_id}
-    if script_id:
+async def _find_key_by_discord(discord_id: str, script_id: Optional[str] = None,
+                               loader_id: Optional[str] = None) -> Optional[dict]:
+    """Look up any key linked to a Discord user, optionally scoped to a script OR a loader."""
+    q: dict = {"discord_id": discord_id}
+    if loader_id:
+        q["loader_id"] = loader_id
+    elif script_id:
         q["script_id"] = script_id
     return await db.wl_keys.find_one(q, {"_id": 0})
+
+
+async def _resolve_target(target_id: str) -> tuple[Optional[dict], str]:
+    """Given an id, return (doc, kind) where kind is 'script', 'loader', or 'none'."""
+    doc = await db.scripts.find_one({"id": target_id}, {"_id": 0, "obfuscated": 0, "source": 0})
+    if doc:
+        return doc, "script"
+    doc = await db.loaders.find_one({"id": target_id}, {"_id": 0})
+    if doc:
+        return doc, "loader"
+    return None, "none"
 
 
 class RedeemModal(discord.ui.Modal, title="Redeem Your Key"):
@@ -1245,9 +1260,17 @@ class RedeemModal(discord.ui.Modal, title="Redeem Your Key"):
         if not row:
             await interaction.response.send_message(_err("Invalid key."), ephemeral=True)
             return
-        if row.get("script_id") != self.panel_cfg["script_id"]:
+        # A key must be for either this panel's script or this panel's loader
+        panel_script = self.panel_cfg.get("script_id")
+        panel_loader = self.panel_cfg.get("loader_id")
+        matches = False
+        if panel_loader and row.get("loader_id") == panel_loader:
+            matches = True
+        if panel_script and row.get("script_id") == panel_script:
+            matches = True
+        if not matches:
             await interaction.response.send_message(
-                _err("This key is not for this script."), ephemeral=True)
+                _err("This key is not for this script/loader."), ephemeral=True)
             return
         # Link discord id
         await db.wl_keys.update_one(
@@ -1360,20 +1383,30 @@ class ScriptPanel(discord.ui.View):
     async def getscript(self, interaction: discord.Interaction, button: discord.ui.Button):
         cfg = await self._cfg(interaction)
         if not cfg: return
-        row = await _find_key_by_discord(str(interaction.user.id), cfg["script_id"])
+        row = await _find_key_by_discord(
+            str(interaction.user.id),
+            script_id=cfg.get("script_id"),
+            loader_id=cfg.get("loader_id"),
+        )
         if not row:
             await interaction.response.send_message(
                 _err("No key linked to your Discord. Click **Redeem Key** first."),
                 ephemeral=True)
             return
-        loader = f"{PUBLIC_API_URL}/api/loader/{cfg['script_id']}.lua"
-        snippet = f'script_key = "{row["key"]}"\nloadstring(game:HttpGet("{loader}"))()'
+        if cfg.get("loader_id"):
+            # Loader panel → give the all-in-one bundle URL (runs every script in the loader)
+            loader_url = f"{PUBLIC_API_URL}/api/loader/{cfg['loader_id']}/bundle.lua"
+            footer = "Bundle loader — runs every script in this loader. Key is bound to your account & HWID."
+        else:
+            loader_url = f"{PUBLIC_API_URL}/api/loader/{cfg['script_id']}.lua"
+            footer = "Paste into your executor. Key is bound to your account & HWID."
+        snippet = f'script_key = "{row["key"]}"\nloadstring(game:HttpGet("{loader_url}"))()'
         e = discord.Embed(
             title="📥 Your Script",
             description=f"```lua\n{snippet}\n```",
             color=0x007AFF,
         )
-        e.set_footer(text="Paste into your executor. Key is bound to your account & HWID.")
+        e.set_footer(text=footer)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     @discord.ui.button(label="Get Role", style=discord.ButtonStyle.success,
@@ -1381,7 +1414,11 @@ class ScriptPanel(discord.ui.View):
     async def getrole(self, interaction: discord.Interaction, button: discord.ui.Button):
         cfg = await self._cfg(interaction)
         if not cfg: return
-        row = await _find_key_by_discord(str(interaction.user.id), cfg["script_id"])
+        row = await _find_key_by_discord(
+            str(interaction.user.id),
+            script_id=cfg.get("script_id"),
+            loader_id=cfg.get("loader_id"),
+        )
         if not row:
             await interaction.response.send_message(
                 _err("No key linked. Redeem a key first."), ephemeral=True)
@@ -1413,7 +1450,11 @@ class ScriptPanel(discord.ui.View):
     async def getstats(self, interaction: discord.Interaction, button: discord.ui.Button):
         cfg = await self._cfg(interaction)
         if not cfg: return
-        row = await _find_key_by_discord(str(interaction.user.id), cfg["script_id"])
+        row = await _find_key_by_discord(
+            str(interaction.user.id),
+            script_id=cfg.get("script_id"),
+            loader_id=cfg.get("loader_id"),
+        )
         if not row:
             await interaction.response.send_message(
                 _err("No key linked to your Discord."), ephemeral=True)
@@ -1448,102 +1489,162 @@ class ScriptPanel(discord.ui.View):
 
 @tree.command(name="panel", description="Create your MOD_CTRL script panel with 5 buttons.")
 @app_commands.describe(
-    script_name="Display name (e.g. 'Yuna - Custom Loader')",
-    script_id="Your MOD_CTRL script ID (from the Scripts page in the dashboard)",
+    display_name="Display name shown on the panel (e.g. 'Yuna - Custom Loader')",
+    target_id="Your MOD_CTRL script ID OR loader ID (from the dashboard)",
     customer_role="Role granted to users after redeeming a key",
 )
 @guild_only()
 @needs_auth()
-async def panel_cmd(interaction: discord.Interaction, script_name: str,
-                    script_id: str, customer_role: discord.Role):
-    # Validate script exists in local db
-    script = await db.scripts.find_one({"id": script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
-    if not script:
+async def panel_cmd(interaction: discord.Interaction, display_name: str,
+                    target_id: str, customer_role: discord.Role):
+    target_id = target_id.strip()
+    target, kind = await _resolve_target(target_id)
+    if not target:
         await _reply(interaction, _err(
-            "Script ID not found. Go to the Scripts page in the dashboard and copy its ID."))
+            "ID not found. Paste a Script ID from the Scripts page OR a Loader ID from the Loaders page."))
         return
 
+    if kind == "loader":
+        scripts_in_loader = await db.scripts.count_documents({"loader_id": target_id})
+        subtitle = f"Loader • {scripts_in_loader} script(s) bundled"
+    else:
+        subtitle = f"Script • {target.get('level', '?').upper()}"
+
     description = (
-        f"**Script:** {script_name}\n\n"
+        f"**{display_name}**\n_{subtitle}_\n\n"
         "Use the buttons below to manage your account:\n"
-        "• Redeem your key to link your Discord account\n"
-        "• Get the script loader code\n"
-        "• Receive your customer role\n"
-        "• Reset your hardware ID\n"
-        "• View your account statistics"
+        "• **Redeem Key** — link your key to your Discord\n"
+        "• **Get Script** — copy the loader snippet for your executor\n"
+        "• **Get Role** — receive your customer role\n"
+        "• **Reset HWID** — bind a new device (cooldown enforced)\n"
+        "• **Get Stats** — view your account info"
     )
     embed = discord.Embed(
-        title=f"{script_name} — Script Panel",
+        title=f"{display_name} — Panel",
         description=description,
         color=0x007AFF,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text="MOD_CTRL")
+    embed.set_footer(text=f"MOD_CTRL • {kind}")
 
     await interaction.response.send_message(embed=embed, view=ScriptPanel())
     msg = await interaction.original_response()
 
+    panel_doc = {
+        "message_id": str(msg.id),
+        "channel_id": str(interaction.channel.id),
+        "guild_id": str(interaction.guild.id),
+        "script_name": display_name,
+        "customer_role_id": str(customer_role.id),
+        "kind": kind,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if kind == "loader":
+        panel_doc["loader_id"] = target_id
+        panel_doc["script_id"] = None
+    else:
+        panel_doc["script_id"] = target_id
+        panel_doc["loader_id"] = None
     await db.mc_panels.update_one(
         {"message_id": str(msg.id)},
-        {"$set": {
-            "message_id": str(msg.id),
-            "channel_id": str(interaction.channel.id),
-            "guild_id": str(interaction.guild.id),
-            "script_name": script_name,
-            "script_id": script_id,
-            "customer_role_id": str(customer_role.id),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }},
+        {"$set": panel_doc},
         upsert=True,
     )
-    _log(f"[panel] created: guild={interaction.guild.id} script={script_id}")
+    _log(f"[panel] created: guild={interaction.guild.id} kind={kind} target={target_id}")
 
 
-@tree.command(name="whitelist", description="Generate a key for a user and DM it to them.")
+@tree.command(name="whitelist", description="Whitelist a user for a script/loader and grant them a role. No key is DM'd.")
 @app_commands.describe(
-    user="Discord user",
-    script_id="Your script ID (from the Scripts page)",
-    days="Days until key expires (0 = never)",
+    user="Discord user to whitelist",
+    target_id="Script ID OR Loader ID (from the dashboard)",
+    role="Role to grant the user (this is the role that unlocks the panel for them)",
+    days="Days until access expires (0 = never)",
     note="Optional note",
 )
 @guild_only()
 @needs_auth()
 async def whitelist_cmd(interaction: discord.Interaction, user: discord.Member,
-                        script_id: str, days: Optional[int] = 0, note: Optional[str] = None):
-    script = await db.scripts.find_one({"id": script_id}, {"_id": 0, "obfuscated": 0, "source": 0})
-    if not script:
-        await _reply(interaction, _err("Script ID not found."))
+                        target_id: str, role: discord.Role,
+                        days: Optional[int] = 0, note: Optional[str] = None):
+    target_id = target_id.strip()
+    target, kind = await _resolve_target(target_id)
+    if not target:
+        await _reply(interaction, _err(
+            "ID not found. Paste a Script ID or a Loader ID from the dashboard."))
         return
+
     now = datetime.now(timezone.utc)
     expires_at = None
     if days and days > 0:
         expires_at = (now + timedelta(days=int(days))).isoformat()
-    key_str = _secrets_lib.token_urlsafe(24)
-    doc = {
-        "id": str(_secrets_lib.token_hex(16)),
-        "key": key_str,
-        "script_id": script_id,
-        "script_name": script.get("name"),
-        "discord_id": str(user.id),
-        "note": note,
-        "hwid": None,
-        "status": "active",
-        "executions": 0,
-        "created_at": now.isoformat(),
-        "expires_at": expires_at,
-        "last_used": None,
-    }
-    await db.wl_keys.insert_one(doc)
+
+    # Grant the role first
+    role_ok = True
+    role_err = ""
     try:
-        await user.send(
-            f"🔑 You've been whitelisted for **{script.get('name')}**!\n"
-            f"Your key: ||`{key_str}`||\n"
-            f"Keep it private."
-        )
-        dm_status = "DM sent."
-    except Exception:
-        dm_status = "Couldn't DM (their DMs are closed)."
-    await _reply(interaction, _ok(f"Whitelisted {user.mention}. {dm_status}"), ephemeral=False)
+        await user.add_roles(role, reason=f"MOD_CTRL: whitelisted by {interaction.user}")
+    except discord.Forbidden:
+        role_ok = False
+        role_err = "role hierarchy — the bot's top role must be above the target role"
+    except Exception as e:
+        role_ok = False
+        role_err = str(e)
+
+    # Check for existing whitelist to prevent duplicates
+    scope_filter = ({"loader_id": target_id} if kind == "loader"
+                    else {"script_id": target_id})
+    existing = await db.wl_keys.find_one(
+        {"discord_id": str(user.id), **scope_filter, "status": "active"},
+        {"_id": 0},
+    )
+    if existing:
+        # Refresh expiry and note, but keep the same silent key
+        upd = {"note": note, "granted_role_id": str(role.id)}
+        if expires_at:
+            upd["expires_at"] = expires_at
+        await db.wl_keys.update_one({"id": existing["id"]}, {"$set": upd})
+        msg = f"Already whitelisted for **{target.get('name') or target_id}** ({kind}); refreshed expiry."
+    else:
+        key_str = _secrets_lib.token_urlsafe(24)
+        doc = {
+            "id": str(_secrets_lib.token_hex(16)),
+            "key": key_str,
+            "script_id": target_id if kind == "script" else None,
+            "script_name": target.get("name") if kind == "script" else None,
+            "loader_id": target_id if kind == "loader" else None,
+            "loader_name": target.get("name") if kind == "loader" else None,
+            "discord_id": str(user.id),
+            "granted_role_id": str(role.id),
+            "note": note,
+            "hwid": None,
+            "status": "active",
+            "executions": 0,
+            "created_at": now.isoformat(),
+            "expires_at": expires_at,
+            "last_used": None,
+            "silent": True,  # Marker: key was never shown to the user
+        }
+        await db.wl_keys.insert_one(doc)
+        msg = f"Whitelisted for **{target.get('name') or target_id}** ({kind})."
+
+    if role_ok:
+        role_line = f"Role granted: {role.mention}"
+    else:
+        role_line = f"⚠️  Could not grant {role.mention}: {role_err}"
+
+    await _reply(
+        interaction,
+        _ok(f"{user.mention}: {msg}\n{role_line}\n"
+            f"They can now click **Get Script** on the panel to receive their loader."),
+        ephemeral=False,
+    )
+    await _post_audit({
+        "guild_id": str(interaction.guild.id), "guild_name": interaction.guild.name,
+        "actor_id": str(interaction.user.id), "actor_name": str(interaction.user),
+        "action": "whitelist",
+        "details": {"target_id": target_id, "kind": kind, "user": str(user),
+                    "role": str(role), "expires_at": expires_at},
+    })
 
 
 @tree.command(name="revoke", description="Revoke a key (immediate).")
@@ -1668,13 +1769,20 @@ async def keyinfo_cmd(interaction: discord.Interaction, user_key: str):
     if not row:
         await _reply(interaction, _err("Key not found."))
         return
+    scope = (
+        f"Loader: {row.get('loader_name') or row.get('loader_id')}"
+        if row.get("loader_id")
+        else f"Script: {row.get('script_name') or row.get('script_id')}"
+    )
     e = discord.Embed(title="🔑 Key Details", color=0x007AFF)
-    e.add_field(name="Script", value=str(row.get("script_name") or row.get("script_id")))
+    e.add_field(name="Scope", value=scope, inline=False)
     e.add_field(name="Discord", value=str(row.get("discord_id") or "—"))
     e.add_field(name="Status", value=str(row.get("status", "active")))
     e.add_field(name="Executions", value=str(row.get("executions", 0)))
-    e.add_field(name="HWID", value="locked" if row.get("hwid") else "unbound")
+    e.add_field(name="HWID", value="🔒 locked" if row.get("hwid") else "🔓 unbound")
+    e.add_field(name="Mismatches", value=str(row.get("hwid_mismatch_count", 0)))
     e.add_field(name="Expires", value=str(row.get("expires_at") or "never"))
+    e.add_field(name="Last used", value=str(row.get("last_used") or "never"))
     e.add_field(name="Note", value=str(row.get("note") or "—"), inline=False)
     await _reply(interaction, "", embed=e, ephemeral=False)
 

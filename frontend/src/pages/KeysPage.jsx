@@ -6,43 +6,49 @@ import { Copy, RefreshCcw, Trash2, Plus, Loader2, KeySquare } from "lucide-react
 export default function KeysPage() {
   const [keys, setKeys] = useState([]);
   const [scripts, setScripts] = useState([]);
+  const [loaders, setLoaders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [form, setForm] = useState({ script_id: "", discord_id: "", note: "", expires_days: 0 });
+  const [form, setForm] = useState({ target: "", discord_id: "", note: "", expires_days: 0 });
   const [backendUrl] = useState(process.env.REACT_APP_BACKEND_URL);
 
   const load = async () => {
     setLoading(true);
     try {
-      const [k, s] = await Promise.all([api.get("/keys"), api.get("/scripts")]);
+      const [k, s, l] = await Promise.all([
+        api.get("/keys"),
+        api.get("/scripts"),
+        api.get("/loaders"),
+      ]);
       setKeys(k.data.keys || []);
       setScripts(s.data.scripts || []);
+      setLoaders(l.data.loaders || []);
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
   const create = async () => {
-    if (!form.script_id) {
-      toast.error("Pick a script");
+    if (!form.target) {
+      toast.error("Pick a script or loader");
       return;
     }
+    const [kind, id] = form.target.split(":", 2);
     setCreating(true);
     try {
-      const r = await api.post("/keys", {
-        script_id: form.script_id,
+      const body = {
         discord_id: form.discord_id || null,
         note: form.note || null,
         expires_days: form.expires_days ? Number(form.expires_days) : null,
-      });
+      };
+      if (kind === "loader") body.loader_id = id; else body.script_id = id;
+      const r = await api.post("/keys", body);
       toast.success("Key created");
       await navigator.clipboard.writeText(r.data.key.key);
       toast.success("Key copied to clipboard");
-      setForm({ script_id: form.script_id, discord_id: "", note: "", expires_days: 0 });
+      setForm({ target: form.target, discord_id: "", note: "", expires_days: 0 });
       await load();
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Failed to create key");
@@ -60,7 +66,7 @@ export default function KeysPage() {
 
   const resetHwid = async (id) => {
     await api.post(`/keys/${id}/resethwid`);
-    toast.success("HWID reset");
+    toast.success("HWID reset — cooldown cleared, key unlocked");
     await load();
   };
 
@@ -69,9 +75,11 @@ export default function KeysPage() {
     toast.success("Key copied");
   };
 
-  const copyLoader = async (script_id) => {
-    const url = `${backendUrl}/api/loader/${script_id}.lua`;
-    const snippet = `script_key = "PASTE_KEY_HERE"\nloadstring(game:HttpGet("${url}"))()`;
+  const copyLoader = async (k) => {
+    const id = k.loader_id || k.script_id;
+    const suffix = k.loader_id ? `${id}/bundle.lua` : `${id}.lua`;
+    const url = `${backendUrl}/api/loader/${suffix}`;
+    const snippet = `script_key = "${k.key}"\nloadstring(game:HttpGet("${url}"))()`;
     await navigator.clipboard.writeText(snippet);
     toast.success("Loader snippet copied");
   };
@@ -103,15 +111,30 @@ export default function KeysPage() {
         </div>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
           <select
-            data-testid="key-script"
-            value={form.script_id}
-            onChange={(e) => setForm({ ...form, script_id: e.target.value })}
+            data-testid="key-target"
+            value={form.target}
+            onChange={(e) => setForm({ ...form, target: e.target.value })}
             className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white"
           >
-            <option value="">— pick a script —</option>
-            {scripts.map((s) => (
-              <option key={s.id} value={s.id}>{s.name} ({s.level})</option>
-            ))}
+            <option value="">— pick a script or loader —</option>
+            {loaders.length > 0 && (
+              <optgroup label="Loaders (bundle of scripts)">
+                {loaders.map((l) => (
+                  <option key={l.id} value={`loader:${l.id}`}>
+                    📦 {l.name} — {(l.scripts || []).length} script(s)
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {scripts.length > 0 && (
+              <optgroup label="Standalone Scripts">
+                {scripts.map((s) => (
+                  <option key={s.id} value={`script:${s.id}`}>
+                    📄 {s.name} ({s.level})
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
           <input
             data-testid="key-discord"
@@ -175,7 +198,15 @@ export default function KeysPage() {
                   <span className="truncate">{k.key}</span>
                 </div>
                 <div className="text-[10px] text-white/40 mt-0.5 font-mono truncate">
-                  {k.script_name || k.script_id} · {k.note || "no note"}
+                  {k.loader_id
+                    ? `📦 ${k.loader_name || k.loader_id}`
+                    : `📄 ${k.script_name || k.script_id}`}
+                  {" · "}
+                  {k.status === "locked" ? (
+                    <span className="text-[#FF6961]">LOCKED</span>
+                  ) : (
+                    k.note || "no note"
+                  )}
                 </div>
               </div>
               <span className="font-mono text-white/60 truncate">{k.discord_id || "—"}</span>
@@ -191,7 +222,7 @@ export default function KeysPage() {
                   className="p-1.5 border border-white/10 hover:border-white/30 text-white/60 hover:text-white transition-colors duration-75">
                   <Copy className="w-3.5 h-3.5" />
                 </button>
-                <button onClick={() => copyLoader(k.script_id)} title="Copy loader"
+                <button onClick={() => copyLoader(k)} title="Copy loader snippet"
                   className="p-1.5 border border-white/10 hover:border-white/30 text-white/60 hover:text-white transition-colors duration-75 text-[10px] font-mono">
                   ldr
                 </button>

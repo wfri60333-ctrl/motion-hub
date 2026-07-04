@@ -381,7 +381,7 @@ async def list_commands():
         ("welcome", "Set a welcome channel.", "config", False),
         # script protection (native)
         ("panel", "Create your script panel with 5 buttons (Redeem/Get Script/Get Role/Reset HWID/Stats).", "protection", False),
-        ("whitelist", "Generate a key for a user and DM it to them.", "protection", False),
+        ("whitelist", "Whitelist a user for a script/loader and grant a role (no key DM'd).", "protection", False),
         ("revoke", "Revoke a key (immediate).", "protection", True),
         ("resethwid", "Force-reset HWID for a key (admin, bypasses cooldown, unlocks).", "protection", False),
         ("forceresethwid", "Alias of /resethwid — force-reset a user's HWID.", "protection", False),
