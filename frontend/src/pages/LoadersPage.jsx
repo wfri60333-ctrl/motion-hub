@@ -93,7 +93,7 @@ export default function LoadersPage() {
             data-testid="loader-name"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            placeholder="loader name (e.g. Yuna)"
+            placeholder="loader name"
             className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30"
           />
           <input
@@ -236,10 +236,10 @@ function UploadRow({ loader, onDone }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-[1fr_140px_120px_auto] gap-2 mt-2 pt-2 border-t border-white/10">
       <input value={name} onChange={(e) => setName(e.target.value)}
-        placeholder="script name (e.g. Aimbot v2)"
+        placeholder="script name"
         className="bg-black border border-white/15 focus:border-[#34C759] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30" />
       <input value={slug} onChange={(e) => setSlug(e.target.value)}
-        placeholder="slug (aimbot)"
+        placeholder="slug"
         className="bg-black border border-white/15 focus:border-[#34C759] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30" />
       <select value={level} onChange={(e) => setLevel(e.target.value)}
         className="bg-black border border-white/15 focus:border-[#34C759] outline-none px-3 py-2 font-mono text-xs text-white">
@@ -293,7 +293,7 @@ function AttachRow({ loader, scripts, onAttach }) {
       <input
         value={slug}
         onChange={(e) => setSlug(e.target.value)}
-        placeholder="slug (e.g. aimbot)"
+        placeholder="slug"
         className="bg-black border border-white/15 focus:border-[#007AFF] outline-none px-3 py-2 font-mono text-xs text-white placeholder:text-white/30"
       />
       <button
