@@ -1,3 +1,4 @@
+"""
 Discord Moderation Bot — MOD_CTRL
 50+ slash commands. See COMMAND_LIST in server.py for the full registry.
 """
