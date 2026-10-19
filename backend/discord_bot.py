@@ -2735,6 +2735,8 @@ class PingSend(discord.ui.View):
         self.channel_id = int(channel_id)
         self.owner_id = None
         self.token = None
+        self.running = False
+        self.stopped = False
 
     async def interaction_check(self, interaction: discord.Interaction):
         if self.owner_id and interaction.user.id != self.owner_id:
@@ -2742,7 +2744,7 @@ class PingSend(discord.ui.View):
             return False
         return True
 
-    async def _mark(self, interaction: discord.Interaction, text: str):
+    async def _mark(self, interaction: discord.Interaction, text: str, view=None):
         try:
             route = discord.http.Route(
                 "PATCH",
@@ -2750,33 +2752,48 @@ class PingSend(discord.ui.View):
                 application_id=APP_ID or interaction.application_id,
                 interaction_token=self.token,
             )
-            await interaction.client.http.request(
-                route, json={"content": text, "components": [], "embeds": [], "attachments": []}
-            )
+            body = {"content": text, "embeds": [], "attachments": []}
+            body["components"] = [] if view is None else view.to_components()
+            await interaction.client.http.request(route, json=body)
         except Exception as exc:
             _log(f"[ping-edit] {exc}")
 
-    @discord.ui.button(label="Send", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success)
     async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.running:
+            await interaction.response.send_message("Already started.", ephemeral=True)
+            return
+        self.running = True
+        button.disabled = True
         mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
         count = len(self.lines)
         word = "ping" if count == 1 else "pings"
         channel = interaction.client.get_channel(self.channel_id)
         if channel is None:
             await interaction.response.send_message(self.lines[0], allowed_mentions=mentions)
+            sent = 1
             for line in self.lines[1:]:
+                if self.stopped:
+                    break
                 await asyncio.sleep(0.6)
+                if self.stopped:
+                    break
                 await interaction.followup.send(line, allowed_mentions=mentions)
-            await self._mark(interaction, f"Sent {count} {word} publicly")
+                sent += 1
+            done = "ping" if sent == 1 else "pings"
+            text = f"Stopped. Sent {sent} {done}." if self.stopped else f"Sent {sent} {done} publicly"
+            await self._mark(interaction, text)
             return
-        await interaction.response.edit_message(content=f"Sending {count} {word}...", embed=None, view=None)
+        await interaction.response.edit_message(content=f"Sending 0/{count}...", embed=None, view=self)
         sent = 0
         for index, line in enumerate(self.lines):
+            if self.stopped:
+                break
             try:
                 await channel.send(line, allowed_mentions=mentions)
                 sent += 1
             except discord.HTTPException as exc:
-                if getattr(exc, "status", None) == 429:
+                if getattr(exc, "status", None) == 429 and not self.stopped:
                     await asyncio.sleep(1.6)
                     try:
                         await channel.send(line, allowed_mentions=mentions)
@@ -2790,20 +2807,36 @@ class PingSend(discord.ui.View):
             except Exception as exc:
                 _log(f"[ping] {exc}")
                 break
+            if self.stopped:
+                break
+            try:
+                await interaction.edit_original_response(content=f"Sending {sent}/{count}...", view=self)
+            except Exception:
+                pass
             if index + 1 < count:
                 await asyncio.sleep(0.6)
         done = "ping" if sent == 1 else "pings"
+        text = f"Stopped. Sent {sent} {done}." if self.stopped else f"Sent {sent} {done} publicly"
         try:
-            await interaction.edit_original_response(content=f"Sent {sent} {done} publicly")
+            await interaction.edit_original_response(content=text, view=None)
         except Exception as exc:
             _log(f"[ping-edit] {exc}")
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def halt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stopped = True
+        if not self.running:
+            await interaction.response.edit_message(content="Stopped.", embed=None, attachments=[], view=None)
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
 
 async def _preview_ping(interaction: discord.Interaction, lines, detail: str, channel_id):
     view = PingSend(lines, channel_id)
     view.owner_id = interaction.user.id
     view.token = interaction.token
-    embed = discord.Embed(title="Ping", description=f"{detail}\nOnly you can see this. Press Send to post it.", color=0x5865F2)
+    embed = discord.Embed(title="Ping", description=f"{detail}\nOnly you can see this. Press Start to post it. Stop cancels.", color=0x5865F2)
     preview = "\n".join(lines)
     if len(preview) > 1900:
         preview = preview[:1900]
