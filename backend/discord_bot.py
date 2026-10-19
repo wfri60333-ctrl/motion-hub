@@ -59,6 +59,8 @@ intents.voice_states = True
 
 client = discord.Client(intents=intents, application_id=APP_ID)
 tree = app_commands.CommandTree(client)
+tree.allowed_installs = app_commands.AppInstallationType(guild=True, user=True)
+tree.allowed_contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
 
 
 # ============= HELPERS =============
