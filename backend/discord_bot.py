@@ -2816,6 +2816,16 @@ async def _preview_ping(interaction: discord.Interaction, lines, detail: str, ch
     )
 
 
+async def _load_members(guild):
+    from discord.state import ChunkRequest
+
+    state = guild._state
+    request = ChunkRequest(guild.id, guild.shard_id, state.loop, state._get_guild, cache=True)
+    state._chunk_requests[request.nonce] = request
+    await state.chunker(guild.id, limit=0, presences=True, nonce=request.nonce)
+    return await asyncio.wait_for(request.wait(), timeout=30)
+
+
 async def _random_ping_targets(interaction: discord.Interaction, status: str, times: int, channel_id):
     guild = interaction.guild
     if guild is None and channel_id:
@@ -2824,16 +2834,22 @@ async def _random_ping_targets(interaction: discord.Interaction, status: str, ti
     if guild is None:
         return None, "Random pings only work in a server this bot is in."
     try:
-        await asyncio.wait_for(guild.chunk(), timeout=20)
+        members = await _load_members(guild)
     except Exception as exc:
-        _log(f"[ping] {exc}")
+        _log(f"[ping] member load failed: {exc}")
+        try:
+            members = await asyncio.wait_for(guild.chunk(cache=True), timeout=25)
+        except Exception as again:
+            _log(f"[ping] chunk failed: {again}")
+            members = list(guild.members)
     pool = [
         member
-        for member in guild.members
-        if member is not None and not member.bot and (status == "any" or _member_status(member) == status)
+        for member in members
+        if member is not None and not getattr(member, "bot", False) and (status == "any" or _member_status(member) == status)
     ]
+    _log(f"[ping] loaded {len(members)} members, {len(pool)} match {status}")
     if not pool:
-        if status == "any":
+        if not members:
             return None, "This bot still can't see the member list. Wait a minute and try again."
         return None, f"Nobody in the member list is {_PING_STATUS[status].lower()}."
     if len(pool) >= times:
