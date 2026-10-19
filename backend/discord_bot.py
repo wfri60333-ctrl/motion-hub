@@ -2391,6 +2391,67 @@ async def ring_cmd(interaction: discord.Interaction):
     await _post_quiet(interaction, "ring ring ring", interaction.channel_id)
 
 
+class SaySend(discord.ui.View):
+    def __init__(self, text, raw, filename, channel_id):
+        super().__init__(timeout=180)
+        self.text = text
+        self.raw = raw
+        self.filename = filename
+        self.channel_id = int(channel_id)
+        self.owner_id = None
+        self.token = None
+
+    def _file(self):
+        if not self.raw:
+            return None
+        return discord.File(_io.BytesIO(self.raw), filename=self.filename or "file")
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Send", style=discord.ButtonStyle.primary)
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
+        if self.text:
+            kwargs["content"] = self.text[:2000]
+        try:
+            channel = interaction.client.get_channel(self.channel_id) or await interaction.client.fetch_channel(self.channel_id)
+            sent = self._file()
+            if sent:
+                await channel.send(file=sent, **kwargs)
+            else:
+                await channel.send(**kwargs)
+            await interaction.response.edit_message(content="Sent 1 message publicly", attachments=[], view=None)
+            return
+        except Exception as exc:
+            _log(f"[say] {exc}")
+        here = int(getattr(interaction.channel, "id", 0) or 0)
+        if here != self.channel_id:
+            await interaction.response.edit_message(content="The bot can't send messages in that channel.", attachments=[], view=None)
+            return
+        sent = self._file()
+        payload = dict(kwargs)
+        payload["ephemeral"] = False
+        if sent:
+            payload["file"] = sent
+        await interaction.response.send_message(**payload)
+        try:
+            route = discord.http.Route(
+                "PATCH",
+                "/webhooks/{application_id}/{interaction_token}/messages/@original",
+                application_id=APP_ID or interaction.application_id,
+                interaction_token=self.token,
+            )
+            await interaction.client.http.request(
+                route, json={"content": "Sent 1 message publicly", "components": [], "attachments": []}
+            )
+        except Exception as exc:
+            _log(f"[say-edit] {exc}")
+
+
 @tree.command(name="say", description="Have the bot say something. Nobody sees who used it.")
 @app_commands.describe(message="What to say. Use \\n for a new line", image="Optional picture", channel_id="Optional channel ID")
 async def say_cmd(
@@ -2403,8 +2464,13 @@ async def say_cmd(
     if not text and image is None:
         await interaction.response.send_message("Type something or add a picture.", ephemeral=True)
         return
+    raw = await image.read() if image is not None else None
     target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
-    await _post_quiet(interaction, text or None, target, image)
+    view = SaySend(text or None, raw, image.filename if image else None, target)
+    view.owner_id = interaction.user.id
+    view.token = interaction.token
+    preview = discord.File(_io.BytesIO(raw), filename=image.filename) if raw else None
+    await interaction.response.send_message(content=text or None, file=preview, view=view, ephemeral=True)
 
 
 @tree.command(name="reply", description="Reply to a message. Nobody sees who used it.")
