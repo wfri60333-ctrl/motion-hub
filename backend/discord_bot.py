@@ -278,7 +278,7 @@ async def on_ready():
     except Exception as exc:
         _log(f"[presence] {exc}")
     try:
-        keep = {"ring", "say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox"}
+        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox"}
         for cmd in list(tree.get_commands()):
             if cmd.name.lower() not in keep:
                 tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
@@ -2386,11 +2386,6 @@ async def _deliver_dm(interaction: discord.Interaction, user_id: str, text: str,
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="ring", description="Ring.")
-async def ring_cmd(interaction: discord.Interaction):
-    await _post_quiet(interaction, "ring ring ring", interaction.channel_id)
-
-
 class SaySend(discord.ui.View):
     def __init__(self, text, raw, filename, channel_id):
         super().__init__(timeout=180)
@@ -2469,8 +2464,12 @@ async def say_cmd(
     view = SaySend(text or None, raw, image.filename if image else None, target)
     view.owner_id = interaction.user.id
     view.token = interaction.token
-    preview = discord.File(_io.BytesIO(raw), filename=image.filename) if raw else None
-    await interaction.response.send_message(content=text or None, file=preview, view=view, ephemeral=True)
+    payload = {"view": view, "ephemeral": True}
+    if text:
+        payload["content"] = text
+    if raw:
+        payload["file"] = discord.File(_io.BytesIO(raw), filename=image.filename)
+    await interaction.response.send_message(**payload)
 
 
 @tree.command(name="reply", description="Reply to a message. Nobody sees who used it.")
