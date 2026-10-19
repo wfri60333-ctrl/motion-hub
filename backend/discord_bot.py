@@ -1,4 +1,3 @@
-"""
 Discord Moderation Bot — MOD_CTRL
 50+ slash commands. See COMMAND_LIST in server.py for the full registry.
 """
@@ -267,6 +266,10 @@ async def on_ready():
     except Exception as e:
         _log(f"[fakeip-view] failed: {e}")
     await _push_runtime()
+    try:
+        await _hub()
+    except Exception as exc:
+        _log(f"[store] startup failed: {exc}")
     
         
 
@@ -1935,22 +1938,81 @@ import re as _re
 import time as _time
 
 _STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_store.json")
+_HUB = None
 
 
-def _load_store():
+def _blank_store():
+    return {"inbox": None, "convos": {}, "contacted": {}}
+
+
+def _norm_ts(value):
     try:
-        with open(_STORE_PATH, "r", encoding="utf-8") as fh:
-            return _json.load(fh)
+        n = int(value)
     except Exception:
-        return {"inbox": None, "convos": {}, "contacted": {}}
+        return int(_time.time())
+    if n > 10_000_000_000:
+        n //= 1000
+    return n
 
 
-def _save_store(store):
+def _seed_store():
+    log = [
+        {"dir": "out", "text": "yo", "at": _norm_ts(1792379892482)},
+        {"dir": "in", "text": "Yoo", "at": _norm_ts(1792379903767)},
+        {"dir": "out", "text": "wsp", "at": _norm_ts(1792379910734)},
+        {"dir": "in", "text": "Who the tf is this 🤣🤣🤣?", "at": _norm_ts(1792379928068)},
+        {"dir": "out", "text": "lmao i’m just a bot made by nxtro", "at": _norm_ts(1792379944954)},
+        {"dir": "in", "text": "Ohh bet", "at": _norm_ts(1792379962558)},
+        {"dir": "out", "text": "i’m just gathering your information while he does stuff", "at": _norm_ts(1792379988585)},
+        {"dir": "in", "text": "Wym", "at": _norm_ts(1792380158322)},
+        {"dir": "out", "text": "hey", "at": _norm_ts(1792413443241)},
+    ]
+    uid = "1261164075979898970"
+    outs = sum(1 for entry in log if entry["dir"] == "out")
+    ins = sum(1 for entry in log if entry["dir"] == "in")
+    store = _blank_store()
+    store["inbox"] = "1387643893641777244"
+    store["convos"][uid] = {"owner": "1387643893641777244", "log": log}
+    store["contacted"][uid] = {
+        "name": "thugginjeff",
+        "username": ".d.b.j",
+        "count": outs + ins,
+        "out": outs,
+        "in": ins,
+        "last": log[-1]["at"],
+    }
+    return store
+
+
+async def _hub():
+    global _HUB
+    if _HUB is not None:
+        return _HUB
+    try:
+        doc = await db.dm_hub.find_one({"_id": "store"})
+        data = (doc or {}).get("data")
+        if isinstance(data, dict) and (data.get("contacted") or data.get("convos")):
+            _HUB = data
+            return _HUB
+    except Exception as exc:
+        _log(f"[store] load failed: {exc}")
+    _HUB = _seed_store()
+    await _save_store()
+    return _HUB
+
+
+async def _save_store():
+    if _HUB is None:
+        return
+    try:
+        await db.dm_hub.update_one({"_id": "store"}, {"$set": {"data": _HUB}}, upsert=True)
+    except Exception as exc:
+        _log(f"[store] mongo save failed: {exc}")
     try:
         with open(_STORE_PATH, "w", encoding="utf-8") as fh:
-            _json.dump(store, fh)
+            _json.dump(_HUB, fh)
     except Exception as exc:
-        _log(f"[store] save failed: {exc}")
+        _log(f"[store] file save failed: {exc}")
 
 
 def _opt(interaction: discord.Interaction, name: str):
@@ -2141,19 +2203,39 @@ class FakeIpView(discord.ui.View):
         self.add_item(FakeIpSelect())
 
 
-def _remember(user: discord.abc.User, text: str, direction: str):
-    store = _load_store()
-    row = store["contacted"].get(str(user.id)) or {"name": str(user), "count": 0, "last": 0}
-    row["name"] = str(user)
+async def _remember(user: discord.abc.User, text: str, direction: str):
+    store = await _hub()
+    row = store["contacted"].get(str(user.id)) or {
+        "name": str(user), "username": getattr(user, "name", ""), "count": 0, "in": 0, "out": 0, "last": 0,
+    }
+    row["name"] = getattr(user, "global_name", None) or getattr(user, "display_name", None) or str(user)
+    row["username"] = getattr(user, "name", "") or row.get("username") or ""
     row["count"] = int(row.get("count") or 0) + 1
+    row[direction] = int(row.get(direction) or 0) + 1
     row["last"] = int(_time.time())
     store["contacted"][str(user.id)] = row
     convo = store["convos"].get(str(user.id)) or {"owner": None, "log": []}
-    convo["log"] = (convo.get("log") or [])[-40:]
+    convo["log"] = (convo.get("log") or [])[-80:]
     convo["log"].append({"dir": direction, "text": (text or "")[:500], "at": row["last"]})
     store["convos"][str(user.id)] = convo
-    _save_store(store)
+    await _save_store()
     return store
+
+
+def _person_block(uid, row, store):
+    log = ((store.get("convos") or {}).get(uid) or {}).get("log") or []
+    recent = "\n".join(
+        f"{'bot' if entry.get('dir') == 'out' else 'them'}: {(entry.get('text') or '')[:120]}"
+        for entry in log[-8:]
+    ) or "no messages saved"
+    name = row.get("name") or uid
+    username = row.get("username")
+    label = f"**{name}**" + (f" (@{username})" if username else "")
+    return (
+        f"{label} (`{uid}`)\n"
+        f"bot sent {int(row.get('out') or 0)} · they sent {int(row.get('in') or 0)}\n"
+        f"{recent}"
+    )
 
 
 @tree.command(name="ring", description="Ring.")
@@ -2244,12 +2326,12 @@ async def dm_cmd(
             reason = "The bot isn't in a server with that person, so Discord won't let it DM them."
         await interaction.response.send_message(reason, ephemeral=True)
         return
-    store = _load_store()
+    store = await _hub()
     convo = store["convos"].get(str(person.id)) or {"owner": None, "log": []}
     convo["owner"] = str(interaction.user.id)
     store["convos"][str(person.id)] = convo
-    _save_store(store)
-    _remember(person, text or (file.filename if file else "file"), "out")
+    await _save_store()
+    await _remember(person, text or (file.filename if file else "file"), "out")
     await interaction.response.send_message(
         f"Sent that message to **{person}**. When they reply, I'll DM you what they said.",
         ephemeral=True,
@@ -2270,7 +2352,7 @@ async def dmreply_cmd(
     if person is None:
         await interaction.response.send_message("Pick a person or paste their ID.", ephemeral=True)
         return
-    store = _load_store()
+    store = await _hub()
     convo = store["convos"].get(str(person.id))
     if not convo or str(convo.get("owner")) != str(interaction.user.id):
         await interaction.response.send_message("That chat isn't yours.", ephemeral=True)
@@ -2288,21 +2370,21 @@ async def dmreply_cmd(
     except discord.HTTPException:
         await interaction.response.send_message("Couldn't send that.", ephemeral=True)
         return
-    _remember(person, text or "file", "out")
+    await _remember(person, text or "file", "out")
     await interaction.response.send_message(f"Sent to **{person}** only.", ephemeral=True)
 
 
 @tree.command(name="dmstop", description="Stop getting replies from a DM.")
 @app_commands.describe(user="Person", id="User ID")
 async def dmstop_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None, id: Optional[str] = None):
-    store = _load_store()
+    store = await _hub()
     if user is None and not id:
         closed = 0
         for key, convo in list(store["convos"].items()):
             if str(convo.get("owner")) == str(interaction.user.id):
                 convo["owner"] = None
                 closed += 1
-        _save_store(store)
+        await _save_store()
         await interaction.response.send_message(f"Closed {closed} DM{'s' if closed != 1 else ''}.", ephemeral=True)
         return
     person = await _person(interaction, user, id)
@@ -2314,46 +2396,41 @@ async def dmstop_cmd(interaction: discord.Interaction, user: Optional[discord.Us
         await interaction.response.send_message("You aren't getting replies from that user.", ephemeral=True)
         return
     convo["owner"] = None
-    _save_store(store)
+    await _save_store()
     await interaction.response.send_message(f"Stopped **{person}**.", ephemeral=True)
 
 
 @tree.command(name="dmlist", description="Show DM history.")
 @app_commands.describe(user="Person", id="User ID")
 async def dmlist_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None, id: Optional[str] = None):
-    store = _load_store()
+    store = await _hub()
     people = store.get("contacted") or {}
     if not people:
-        await interaction.response.send_message("The bot hasn't DMed anyone yet.", ephemeral=True)
+        await interaction.response.send_message("No DMs yet. This lists people the bot messaged and people who messaged the bot.", ephemeral=True)
         return
     focus = str(user.id) if user else _re.sub(r"\D", "", id or "")
-    lines = []
     items = sorted(people.items(), key=lambda item: item[1].get("last") or 0, reverse=True)
     if focus:
         items = [item for item in items if item[0] == focus] or items[:1]
-    for uid, row in items[:15]:
-        log = ((store.get("convos") or {}).get(uid) or {}).get("log") or []
-        recent = log[-6:]
-        history = "\n".join(f"{entry.get('dir', '?')}: {(entry.get('text') or '')[:120]}" for entry in recent) or "no messages saved"
-        lines.append(f"**{row.get('name', uid)}** (`{uid}`) · {row.get('count', 0)} messages\n{history}")
+    lines = [_person_block(uid, row, store) for uid, row in items[:15]]
     await interaction.response.send_message("\n\n".join(lines)[:1900], ephemeral=True)
 
 
-@tree.command(name="dmed", description="Show every person the bot has DMed.")
+@tree.command(name="dmed", description="Show everyone in the DM list.")
 async def dmed_cmd(interaction: discord.Interaction):
-    store = _load_store()
+    store = await _hub()
     people = sorted((store.get("contacted") or {}).items(), key=lambda item: item[1].get("last") or 0, reverse=True)
     if not people:
-        await interaction.response.send_message("This bot hasn't DMed anyone yet.", ephemeral=True)
+        await interaction.response.send_message("No DMs yet.", ephemeral=True)
         return
-    lines = [f"**{row.get('name', uid)}** (`{uid}`) · {row.get('count', 0)} messages" for uid, row in people[:20]]
-    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+    lines = [_person_block(uid, row, store).split("\n")[0] + f"\nbot sent {int(row.get('out') or 0)} · they sent {int(row.get('in') or 0)}" for uid, row in people[:20]]
+    await interaction.response.send_message("\n\n".join(lines)[:1900], ephemeral=True)
 
 
 @tree.command(name="inbox", description="Get a DM when someone messages the bot.")
 @app_commands.describe(enabled="Turn inbox on or off")
 async def inbox_cmd(interaction: discord.Interaction, enabled: Optional[bool] = None):
-    store = _load_store()
+    store = await _hub()
     if enabled is None:
         on = str(store.get("inbox")) == str(interaction.user.id)
         await interaction.response.send_message(
@@ -2363,14 +2440,14 @@ async def inbox_cmd(interaction: discord.Interaction, enabled: Optional[bool] = 
         return
     if enabled:
         store["inbox"] = str(interaction.user.id)
-        _save_store(store)
+        await _save_store()
         await interaction.response.send_message("Inbox is on. I'll DM you whenever someone messages the bot.", ephemeral=True)
         return
     if str(store.get("inbox")) != str(interaction.user.id):
         await interaction.response.send_message("Inbox isn't pointed at you.", ephemeral=True)
         return
     store["inbox"] = None
-    _save_store(store)
+    await _save_store()
     await interaction.response.send_message("Inbox is off.", ephemeral=True)
 
 
@@ -2378,13 +2455,13 @@ async def inbox_cmd(interaction: discord.Interaction, enabled: Optional[bool] = 
 async def on_message(message: discord.Message):
     if message.guild is not None or message.author.bot:
         return
-    store = _load_store()
+    store = await _hub()
     text = (message.content or "").strip()
     if message.attachments:
         text = (text + "\n" + "\n".join(item.url for item in message.attachments)).strip()
     if not text:
         text = "(empty message)"
-    _remember(message.author, text, "in")
+    await _remember(message.author, text, "in")
     owner_id = None
     convo = (store.get("convos") or {}).get(str(message.author.id))
     if convo and convo.get("owner"):
@@ -2394,7 +2471,7 @@ async def on_message(message: discord.Message):
         convo = store["convos"].get(str(message.author.id)) or {"owner": owner_id, "log": []}
         convo["owner"] = str(owner_id)
         store["convos"][str(message.author.id)] = convo
-        _save_store(store)
+        await _save_store()
     if not owner_id or str(owner_id) == str(message.author.id):
         return
     try:
