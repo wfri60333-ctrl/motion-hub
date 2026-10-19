@@ -2849,6 +2849,22 @@ async def _preview_ping(interaction: discord.Interaction, lines, detail: str, ch
     )
 
 
+async def _fetch_members_http(guild):
+    found = []
+    after = None
+    state = guild._state
+    while len(found) < 20000:
+        batch = await state.http.get_members(guild.id, 1000, after)
+        if not batch:
+            break
+        for raw in batch:
+            found.append(discord.Member(data=raw, guild=guild, state=state))
+        if len(batch) < 1000:
+            break
+        after = int(batch[-1]["user"]["id"])
+    return found
+
+
 async def _load_members(guild):
     from discord.state import ChunkRequest
 
@@ -2856,34 +2872,54 @@ async def _load_members(guild):
     request = ChunkRequest(guild.id, guild.shard_id, state.loop, state._get_guild, cache=True)
     state._chunk_requests[request.nonce] = request
     await state.chunker(guild.id, limit=0, presences=True, nonce=request.nonce)
-    return await asyncio.wait_for(request.wait(), timeout=30)
+    return await asyncio.wait_for(request.wait(), timeout=20)
 
 
-async def _random_ping_targets(interaction: discord.Interaction, status: str, times: int, channel_id):
-    guild = interaction.guild
+def _real_guild(interaction: discord.Interaction, channel_id):
+    guild = interaction.client.get_guild(interaction.guild_id) if interaction.guild_id else None
     if guild is None and channel_id:
         cached = interaction.client.get_channel(int(channel_id))
         guild = getattr(cached, "guild", None)
+        if guild is not None and interaction.client.get_guild(guild.id) is None:
+            guild = None
+    return guild
+
+
+async def _random_ping_targets(interaction: discord.Interaction, status: str, times: int, channel_id):
+    guild = _real_guild(interaction, channel_id)
     if guild is None:
-        return None, "Random pings only work in a server this bot is in."
+        return None, "This bot is not in this server, so Discord will not share the member list. Add the bot here, then try again."
     try:
-        members = await _load_members(guild)
+        members = await _fetch_members_http(guild)
     except Exception as exc:
-        _log(f"[ping] member load failed: {exc}")
+        _log(f"[ping] http members failed: {type(exc).__name__}: {exc}")
+        members = []
+    have_status = False
+    if status != "any":
         try:
-            members = await asyncio.wait_for(guild.chunk(cache=True), timeout=25)
-        except Exception as again:
-            _log(f"[ping] chunk failed: {again}")
-            members = list(guild.members)
+            rich = await _load_members(guild)
+            if rich:
+                members = rich
+                have_status = True
+        except Exception as exc:
+            _log(f"[ping] status load failed: {type(exc).__name__}: {exc}")
+    if not members:
+        try:
+            members = await asyncio.wait_for(guild.chunk(cache=True), timeout=20)
+        except Exception as exc:
+            _log(f"[ping] chunk failed: {type(exc).__name__}: {exc}")
+            members = [member for member in guild.members if member is not None]
     pool = [
         member
         for member in members
         if member is not None and not getattr(member, "bot", False) and (status == "any" or _member_status(member) == status)
     ]
-    _log(f"[ping] loaded {len(members)} members, {len(pool)} match {status}")
+    _log(f"[ping] guild={guild.id} loaded={len(members)} match={len(pool)} status={status}")
     if not pool:
         if not members:
-            return None, "This bot still can't see the member list. Wait a minute and try again."
+            return None, "The bot is in this server, but Discord sent no members. Try again in a minute."
+        if status != "any" and not have_status:
+            return None, "The member list loaded, but online status did not. Use Any, or try again."
         return None, f"Nobody in the member list is {_PING_STATUS[status].lower()}."
     if len(pool) >= times:
         chosen = _random.sample(pool, times)
@@ -2895,7 +2931,7 @@ async def _random_ping_targets(interaction: discord.Interaction, status: str, ti
 
 ping_group = app_commands.Group(
     name="ping",
-    description="Ping people. Only you see the preview until you press Send.",
+    description="Ping people. Only you see the preview until you press Start.",
 )
 
 
