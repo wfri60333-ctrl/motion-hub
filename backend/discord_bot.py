@@ -54,7 +54,8 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True  # needed for on_message_delete
 intents.message_content = False  # privileged; we can live without content on snipe
-intents.members = False  # privileged; guarded behind try/except where needed
+intents.members = True
+intents.presences = True
 intents.voice_states = True
 
 client = discord.Client(intents=intents, application_id=APP_ID)
@@ -2458,8 +2459,12 @@ class SaySend(discord.ui.View):
             _log(f"[say-edit] {exc}")
 
 
-@tree.command(name="say", description="Have the bot say something. Nobody sees who used it.")
-@app_commands.describe(message="What to say. Use \\n for a new line", image="Optional picture", channel_id="Optional channel ID")
+@tree.command(name="say", description="Post a message as the bot. Only you see it until you press Send.")
+@app_commands.describe(
+    message="The text to post. Type \\n to start a new line.",
+    image="A picture to post with the text.",
+    channel_id="Channel ID to post in. Leave empty to use this channel.",
+)
 async def say_cmd(
     interaction: discord.Interaction,
     message: Optional[str] = None,
@@ -2661,8 +2666,12 @@ class ChaosSend(discord.ui.View):
             _log(f"[chaos-edit] {exc}")
 
 
-@tree.command(name="chaos", description="Send long random messages. Nobody sees who used it.")
-@app_commands.describe(style="How the noise looks", times="How many messages to send", channel_id="Optional channel ID")
+@tree.command(name="chaos", description="Post long random text. Only you see a sample until you press Send.")
+@app_commands.describe(
+    style="The look of the random text.",
+    times="How many messages to post: 1, 5, or 10.",
+    channel_id="Channel ID to post in. Leave empty to use this channel.",
+)
 @app_commands.choices(
     style=[app_commands.Choice(name=label, value=key) for key, (label, _builder) in _CHAOS.items()],
     times=[
@@ -2790,83 +2799,11 @@ class PingSend(discord.ui.View):
             _log(f"[ping-edit] {exc}")
 
 
-@tree.command(name="ping", description="Ping a person or random people. Only you see it until you press Send.")
-@app_commands.describe(
-    mode="One person, or random people",
-    times="How many pings to send",
-    user="Person to ping",
-    status="For random: any, online, idle, do not disturb, or offline",
-    text="Optional text after the ping",
-    channel_id="Optional channel ID",
-)
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="One user", value="user"),
-        app_commands.Choice(name="Random users", value="random"),
-    ],
-    times=[
-        app_commands.Choice(name="1", value=1),
-        app_commands.Choice(name="5", value=5),
-        app_commands.Choice(name="10", value=10),
-    ],
-    status=[app_commands.Choice(name=label, value=key) for key, label in _PING_STATUS.items()],
-)
-async def ping_cmd(
-    interaction: discord.Interaction,
-    mode: str,
-    times: int,
-    user: Optional[discord.User] = None,
-    status: str = "any",
-    text: Optional[str] = None,
-    channel_id: Optional[str] = None,
-):
-    if mode not in ("user", "random") or times not in (1, 5, 10) or status not in _PING_STATUS:
-        await interaction.response.send_message("Pick who to ping, and 1, 5, or 10.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    note = (text or "").replace("\\n", "\n").strip()
-    target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
-    chosen = []
-    if mode == "user":
-        if user is None:
-            await interaction.followup.send("Pick a user.", ephemeral=True)
-            return
-        chosen = [user for _ in range(times)]
-        detail = f"{user} · {times} time{'s' if times != 1 else ''}"
-    else:
-        guild = interaction.guild
-        if guild is None and target:
-            cached = interaction.client.get_channel(int(target))
-            guild = getattr(cached, "guild", None)
-        if guild is None:
-            await interaction.followup.send("Random only works in a server the bot is in.", ephemeral=True)
-            return
-        try:
-            if not getattr(guild, "chunked", True):
-                await asyncio.wait_for(guild.chunk(), timeout=2)
-        except Exception as exc:
-            _log(f"[ping] {exc}")
-        pool = [
-            member
-            for member in guild.members
-            if member is not None and not member.bot and _member_status(member) and (status == "any" or _member_status(member) == status)
-        ]
-        if not pool:
-            await interaction.followup.send(
-                f"No cached members are {_PING_STATUS[status].lower()}. Random status needs Server Members Intent and Presence Intent turned on for this bot.",
-                ephemeral=True,
-            )
-            return
-        if len(pool) >= times:
-            chosen = _random.sample(pool, times)
-        else:
-            chosen = [_random.choice(pool) for _ in range(times)]
-        detail = f"Random · {_PING_STATUS[status]} · {times} ping{'s' if times != 1 else ''} · {len(pool)} people match"
-    lines = [_ping_line(person.id, note) for person in chosen]
-    view = PingSend(lines, target)
+async def _preview_ping(interaction: discord.Interaction, lines, detail: str, channel_id):
+    view = PingSend(lines, channel_id)
     view.owner_id = interaction.user.id
     view.token = interaction.token
-    embed = discord.Embed(title="Ping", description=f"{detail}\nOnly you can see this.", color=0x5865F2)
+    embed = discord.Embed(title="Ping", description=f"{detail}\nOnly you can see this. Press Send to post it.", color=0x5865F2)
     preview = "\n".join(lines)
     if len(preview) > 1900:
         preview = preview[:1900]
@@ -2879,8 +2816,100 @@ async def ping_cmd(
     )
 
 
-@tree.command(name="reply", description="Reply to a message. Nobody sees who used it.")
-@app_commands.describe(to="Message link or ID", message="What to say. Use \\n for a new line", image="Optional picture")
+async def _random_ping_targets(interaction: discord.Interaction, status: str, times: int, channel_id):
+    guild = interaction.guild
+    if guild is None and channel_id:
+        cached = interaction.client.get_channel(int(channel_id))
+        guild = getattr(cached, "guild", None)
+    if guild is None:
+        return None, "Random pings only work in a server this bot is in."
+    try:
+        await asyncio.wait_for(guild.chunk(), timeout=20)
+    except Exception as exc:
+        _log(f"[ping] {exc}")
+    pool = [
+        member
+        for member in guild.members
+        if member is not None and not member.bot and (status == "any" or _member_status(member) == status)
+    ]
+    if not pool:
+        if status == "any":
+            return None, "This bot still can't see the member list. Wait a minute and try again."
+        return None, f"Nobody in the member list is {_PING_STATUS[status].lower()}."
+    if len(pool) >= times:
+        chosen = _random.sample(pool, times)
+    else:
+        chosen = [_random.choice(pool) for _ in range(times)]
+    detail = f"Random · {_PING_STATUS[status]} · {times} ping{'s' if times != 1 else ''} · {len(pool)} people match"
+    return chosen, detail
+
+
+ping_group = app_commands.Group(
+    name="ping",
+    description="Ping people. Only you see the preview until you press Send.",
+)
+
+
+@ping_group.command(name="user", description="Ping one person, from 1 to 30 times.")
+@app_commands.describe(
+    user="The person who gets pinged.",
+    times="How many times to ping them. From 1 to 30.",
+    text="Extra text after the ping. Leave empty for just the ping.",
+    channel_id="Channel ID to post in. Leave empty to use this channel.",
+)
+async def ping_user_cmd(
+    interaction: discord.Interaction,
+    user: discord.User,
+    times: app_commands.Range[int, 1, 30],
+    text: Optional[str] = None,
+    channel_id: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    note = (text or "").replace("\\n", "\n").strip()
+    target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
+    lines = [_ping_line(user.id, note) for _ in range(int(times))]
+    detail = f"{user} · {int(times)} time{'s' if int(times) != 1 else ''}"
+    await _preview_ping(interaction, lines, detail, target)
+
+
+@ping_group.command(name="random", description="Ping random people in this server, from 1 to 30 times.")
+@app_commands.describe(
+    times="How many pings to send. From 1 to 30.",
+    status="Who to pick: any, online, idle, do not disturb, or offline.",
+    text="Extra text after each ping. Leave empty for just the ping.",
+    channel_id="Channel ID to post in. Leave empty to use this channel.",
+)
+@app_commands.choices(status=[app_commands.Choice(name=label, value=key) for key, label in _PING_STATUS.items()])
+async def ping_random_cmd(
+    interaction: discord.Interaction,
+    times: app_commands.Range[int, 1, 30],
+    status: str = "any",
+    text: Optional[str] = None,
+    channel_id: Optional[str] = None,
+):
+    if status not in _PING_STATUS:
+        await interaction.response.send_message("Pick a status.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    note = (text or "").replace("\\n", "\n").strip()
+    target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
+    chosen, detail = await _random_ping_targets(interaction, status, int(times), target)
+    if chosen is None:
+        await interaction.followup.send(detail, ephemeral=True)
+        return
+    lines = [_ping_line(person.id, note) for person in chosen]
+    await _preview_ping(interaction, lines, detail, target)
+
+
+tree.add_command(ping_group)
+
+
+@tree.command(name="reply", description="Reply to a message as the bot. Nobody sees that you used it.")
+@app_commands.describe(
+    to="The message link, or the message ID if it is in this channel.",
+    message="The reply text. Type \\n to start a new line.",
+    image="A picture to send with the reply.",
+)
 async def reply_cmd(
     interaction: discord.Interaction,
     to: str,
@@ -2916,17 +2945,17 @@ async def reply_menu(interaction: discord.Interaction, message: discord.Message)
     await interaction.response.send_modal(ReplyModal(message))
 
 
-@tree.command(name="fakeip", description="Fake IP lookup. Only you see the person picker.")
+@tree.command(name="fakeip", description="Show a fake network lookup. Only you see the person picker.")
 async def fakeip_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("Make a selection", view=FakeIpView(), ephemeral=True)
 
 
-@tree.command(name="dm", description="DM someone from the bot.")
+@tree.command(name="dm", description="Send a DM from the bot. If they reply, it comes back to you.")
 @app_commands.describe(
-    user="Person",
-    id="Their user ID if they are not in the list",
-    message="What to send",
-    file="Optional file",
+    user="The person to message.",
+    id="Their user ID, if they are not in the picker.",
+    message="What the bot should send. Type \\n for a new line.",
+    file="A file to send with the DM.",
 )
 async def dm_cmd(
     interaction: discord.Interaction,
@@ -2948,7 +2977,7 @@ async def dm_cmd(
     await _deliver_dm(interaction, str(person.id), text, attachment)
 
 
-@tree.command(name="dmreply", description="Reply to someone in the DM list.")
+@tree.command(name="dmreply", description="Pick someone from the DM list and send them a reply.")
 async def dmreply_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     store = await _hub()
@@ -2962,7 +2991,7 @@ async def dmreply_cmd(interaction: discord.Interaction):
     await interaction.followup.send("Make a selection", view=view, ephemeral=True)
 
 
-@tree.command(name="dmlist", description="Pick a person and see the messages. Only you can see it.")
+@tree.command(name="dmlist", description="See everyone the bot has DMed, and everyone who has DMed the bot.")
 async def dmlist_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     store = await _hub()
@@ -2976,8 +3005,8 @@ async def dmlist_cmd(interaction: discord.Interaction):
     await interaction.followup.send("Make a selection", embed=embed, view=_dmlist_view(store), ephemeral=True)
 
 
-@tree.command(name="inbox", description="Get a DM when someone messages the bot.")
-@app_commands.describe(enabled="Turn inbox on or off")
+@tree.command(name="inbox", description="Choose who gets a copy when someone messages the bot.")
+@app_commands.describe(enabled="Turn it on or off. Leave empty to see if it is on.")
 async def inbox_cmd(interaction: discord.Interaction, enabled: Optional[bool] = None):
     await interaction.response.defer(ephemeral=True)
     store = await _hub()
