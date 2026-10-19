@@ -294,7 +294,7 @@ async def _sync_commands():
         return
     _SYNCED = True
     try:
-        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox"}
+        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox", "chaos"}
         for cmd in list(tree.get_commands()):
             if cmd.name.lower() not in keep:
                 tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
@@ -2487,6 +2487,217 @@ async def say_cmd(
     if raw:
         payload["file"] = discord.File(_io.BytesIO(raw), filename=image.filename)
     await interaction.followup.send(**payload)
+
+
+def _clip(text: str, limit: int = 1990) -> str:
+    return text[:limit]
+
+
+def _chaos_static() -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*_+-=[]{}:;<>?/|~"
+    lines = []
+    while sum(len(line) + 1 for line in lines) < 1880:
+        lines.append("".join(_random.choice(alphabet) for _ in range(_random.randint(28, 72))))
+    return _clip("\n".join(lines))
+
+
+def _chaos_glitch() -> str:
+    base = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    marks = [chr(code) for code in range(0x0300, 0x036F)]
+    chunks = []
+    while sum(len(part) for part in chunks) < 1700:
+        char = _random.choice(base)
+        chunks.append(char + "".join(_random.choice(marks) for _ in range(_random.randint(1, 3))))
+        if _random.random() < 0.08:
+            chunks.append("\n")
+    return _clip("".join(chunks))
+
+
+def _chaos_binary() -> str:
+    lines = []
+    while sum(len(line) + 1 for line in lines) < 1880:
+        groups = [" ".join(f"{_random.randint(0, 255):08b}" for _ in range(4)) for _ in range(2)]
+        lines.append("  ".join(groups))
+    return _clip("\n".join(lines))
+
+
+def _chaos_hex() -> str:
+    offset = _random.randint(0x10000000, 0xE0000000)
+    lines = []
+    while sum(len(line) + 1 for line in lines) < 1880:
+        data = [_random.randint(0, 255) for _ in range(16)]
+        hexs = " ".join(f"{item:02X}" for item in data)
+        shown = "".join(chr(item) if 32 <= item < 127 else "." for item in data)
+        lines.append(f"{offset:08X}  {hexs}  |{shown}|")
+        offset += 16
+    return _clip("\n".join(lines))
+
+
+def _chaos_blocks() -> str:
+    chars = " ░▒▓█▄▀▌▐"
+    lines = []
+    while sum(len(line) + 1 for line in lines) < 1880:
+        lines.append("".join(_random.choice(chars) for _ in range(_random.randint(24, 48))))
+    return _clip("\n".join(lines))
+
+
+def _chaos_wide() -> str:
+    plain = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    lines = []
+    while sum(len(line) + 1 for line in lines) < 1500:
+        raw = "".join(_random.choice(plain) for _ in range(_random.randint(12, 28)))
+        wide = []
+        for char in raw:
+            if "A" <= char <= "Z":
+                wide.append(chr(0xFF21 + ord(char) - 65))
+            elif "a" <= char <= "z":
+                wide.append(chr(0xFF41 + ord(char) - 97))
+            else:
+                wide.append(chr(0xFF10 + ord(char) - 48))
+        lines.append("".join(wide))
+    return _clip("\n".join(lines))
+
+
+def _chaos_boxes() -> str:
+    chars = "─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬╱╲╳╭╮╯╰"
+    lines = []
+    while sum(len(line) + 1 for line in lines) < 1880:
+        lines.append("".join(_random.choice(chars) for _ in range(_random.randint(20, 42))))
+    return _clip("\n".join(lines))
+
+
+def _chaos_corrupt() -> str:
+    tags = ("FAULT", "SEGV", "PANIC", "HEAP", "STACK", "ABORT", "NULL", "TRACE", "WATCH", "OVERFLOW")
+    junk = "0123456789abcdef"
+    lines = []
+    addr = _random.randint(0x0000000010000000, 0x00000000F0000000)
+    while sum(len(line) + 1 for line in lines) < 1880:
+        tag = _random.choice(tags)
+        blob = "".join(_random.choice(junk) for _ in range(_random.randint(24, 64)))
+        lines.append(f"0x{addr:016x}  {tag:<9} {blob}")
+        addr += _random.choice((16, 32, 64, 128, 4096))
+    return _clip("\n".join(lines))
+
+
+_CHAOS = {
+    "static": ("Static burst", _chaos_static),
+    "glitch": ("Zalgo glitch", _chaos_glitch),
+    "binary": ("Binary stream", _chaos_binary),
+    "hex": ("Hex dump", _chaos_hex),
+    "blocks": ("Shade blocks", _chaos_blocks),
+    "wide": ("Fullwidth", _chaos_wide),
+    "boxes": ("Box fracture", _chaos_boxes),
+    "corrupt": ("Memory corrupt", _chaos_corrupt),
+}
+
+
+def _chaos_text(style: str) -> str:
+    builder = _CHAOS.get(style, _CHAOS["static"])[1]
+    return _clip(builder())
+
+
+class ChaosSend(discord.ui.View):
+    def __init__(self, style: str, times: int, channel_id):
+        super().__init__(timeout=180)
+        self.style = style
+        self.times = times
+        self.channel_id = int(channel_id)
+        self.owner_id = None
+        self.token = None
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    async def _mark(self, interaction: discord.Interaction, text: str):
+        try:
+            route = discord.http.Route(
+                "PATCH",
+                "/webhooks/{application_id}/{interaction_token}/messages/@original",
+                application_id=APP_ID or interaction.application_id,
+                interaction_token=self.token,
+            )
+            await interaction.client.http.request(route, json={"content": text, "components": [], "embeds": [], "attachments": []})
+        except Exception as exc:
+            _log(f"[chaos-edit] {exc}")
+
+    @discord.ui.button(label="Send", style=discord.ButtonStyle.danger)
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        word = "message" if self.times == 1 else "messages"
+        channel = interaction.client.get_channel(self.channel_id)
+        if channel is None:
+            texts = [_chaos_text(self.style) for _ in range(self.times)]
+            await interaction.response.send_message(texts[0], allowed_mentions=discord.AllowedMentions.none())
+            for text in texts[1:]:
+                await asyncio.sleep(0.55)
+                await interaction.followup.send(text, allowed_mentions=discord.AllowedMentions.none())
+            await self._mark(interaction, f"Sent {self.times} {word} publicly")
+            return
+        await interaction.response.edit_message(content=f"Sending {self.times} {word}...", embed=None, view=None)
+        sent = 0
+        for index in range(self.times):
+            text = _chaos_text(self.style)
+            try:
+                await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+                sent += 1
+            except discord.HTTPException as exc:
+                if getattr(exc, "status", None) == 429:
+                    await asyncio.sleep(1.6)
+                    try:
+                        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+                        sent += 1
+                    except Exception as again:
+                        _log(f"[chaos] {again}")
+                        break
+                else:
+                    _log(f"[chaos] {exc}")
+                    break
+            except Exception as exc:
+                _log(f"[chaos] {exc}")
+                break
+            if index + 1 < self.times:
+                await asyncio.sleep(0.55)
+        done = "message" if sent == 1 else "messages"
+        try:
+            await interaction.edit_original_response(content=f"Sent {sent} {done} publicly")
+        except Exception as exc:
+            _log(f"[chaos-edit] {exc}")
+
+
+@tree.command(name="chaos", description="Send long random messages. Nobody sees who used it.")
+@app_commands.describe(style="How the noise looks", times="How many messages to send", channel_id="Optional channel ID")
+@app_commands.choices(
+    style=[app_commands.Choice(name=label, value=key) for key, (label, _builder) in _CHAOS.items()],
+    times=[
+        app_commands.Choice(name="1", value=1),
+        app_commands.Choice(name="5", value=5),
+        app_commands.Choice(name="10", value=10),
+    ],
+)
+async def chaos_cmd(
+    interaction: discord.Interaction,
+    style: str,
+    times: int,
+    channel_id: Optional[str] = None,
+):
+    if style not in _CHAOS or times not in (1, 5, 10):
+        await interaction.response.send_message("Pick a style and 1, 5, or 10.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    sample = _chaos_text(style)
+    target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
+    view = ChaosSend(style, times, target)
+    view.owner_id = interaction.user.id
+    view.token = interaction.token
+    label = _CHAOS[style][0]
+    embed = discord.Embed(
+        title=label,
+        description=f"Sends {times} different message{'s' if times != 1 else ''}. Only you can see this.",
+        color=0xED4245,
+    )
+    await interaction.followup.send(content=sample, embed=embed, view=view, ephemeral=True)
 
 
 @tree.command(name="reply", description="Reply to a message. Nobody sees who used it.")
