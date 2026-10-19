@@ -996,11 +996,6 @@ async def move_cmd(interaction: discord.Interaction, user: discord.Member,
 
 
 # ============= INFO =============
-@tree.command(name="ping", description="Show bot gateway latency.")
-async def ping_cmd(interaction: discord.Interaction):
-    await _reply(interaction, f"🏓 **{round(client.latency*1000)}ms**", ephemeral=False)
-
-
 @tree.command(name="uptime", description="Show bot uptime.")
 async def uptime_cmd(interaction: discord.Interaction):
     await _reply(interaction, f"⏱ Uptime: **{_human_delta(datetime.now(timezone.utc) - STARTED_AT)}**",
