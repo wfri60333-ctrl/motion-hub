@@ -263,11 +263,7 @@ async def on_ready():
     except Exception as e:
         _log(f"[persistent-view] failed: {e}")
     try:
-        synced = await tree.sync()
-        _log(f"[sync] synced {len(synced)} global command(s)")
-    except Exception as e:
-        _log(f"[sync] failed: {e}")
-    await _push_runtime()
+        
 
 
 @client.event
