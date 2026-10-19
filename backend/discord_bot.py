@@ -262,7 +262,13 @@ async def on_ready():
         client.add_view(ScriptPanel())
     except Exception as e:
         _log(f"[persistent-view] failed: {e}")
+    try:
+        client.add_view(FakeIpView())
+    except Exception as e:
+        _log(f"[fakeip-view] failed: {e}")
     await _push_runtime()
+    
+        
 
 
 @client.event
@@ -1055,12 +1061,7 @@ async def invites_cmd(interaction: discord.Interaction):
 
 
 # ============= UTILITY =============
-@tree.command(name="say", description="Have the bot say something in this channel.")
-@guild_only()
-@needs_auth()
-async def say_cmd(interaction: discord.Interaction, message: str):
-    await interaction.channel.send(message)
-    await _reply(interaction, _ok("Sent."))
+# say command is defined with the new commands below
 
 
 @tree.command(name="embed", description="Post an embed in this channel.")
@@ -1924,6 +1925,487 @@ async def obfuscate_cmd(interaction: discord.Interaction, file: discord.Attachme
     embed.add_field(name="Output", value=f"{len(output)} bytes", inline=True)
     embed.add_field(name="Inflation", value=f"×{len(output)/max(1,len(code)):.1f}", inline=True)
     await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
+
+
+# ============= NEW COMMANDS =============
+import io as _io
+import json as _json
+import random as _random
+import re as _re
+import time as _time
+
+_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_store.json")
+
+
+def _load_store():
+    try:
+        with open(_STORE_PATH, "r", encoding="utf-8") as fh:
+            return _json.load(fh)
+    except Exception:
+        return {"inbox": None, "convos": {}, "contacted": {}}
+
+
+def _save_store(store):
+    try:
+        with open(_STORE_PATH, "w", encoding="utf-8") as fh:
+            _json.dump(store, fh)
+    except Exception as exc:
+        _log(f"[store] save failed: {exc}")
+
+
+def _opt(interaction: discord.Interaction, name: str):
+    for opt in (interaction.data or {}).get("options") or []:
+        if opt.get("name") == name:
+            return opt.get("value")
+    return None
+
+
+def _parse_ref(text: str, fallback_channel):
+    match = _re.search(r"channels/\d+/(\d+)/(\d+)", text or "")
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    digits = _re.sub(r"\D", "", text or "")
+    if digits and fallback_channel:
+        return int(fallback_channel), int(digits)
+    return None
+
+
+async def _person(interaction: discord.Interaction, user: Optional[discord.User], raw_id: Optional[str]):
+    if user is not None:
+        return user
+    digits = _re.sub(r"\D", "", raw_id or "")
+    if not digits:
+        return None
+    try:
+        return await interaction.client.fetch_user(int(digits))
+    except Exception:
+        return None
+
+
+async def _file_from(attachment: Optional[discord.Attachment]):
+    if attachment is None:
+        return None
+    raw = await attachment.read()
+    return discord.File(_io.BytesIO(raw), filename=attachment.filename)
+
+
+async def _post_quiet(interaction: discord.Interaction, content: Optional[str], channel_id, attachment=None, reference_id=None):
+    channel_id = int(channel_id)
+    discord_file = await _file_from(attachment)
+    try:
+        channel = interaction.client.get_channel(channel_id) or await interaction.client.fetch_channel(channel_id)
+        kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
+        if content:
+            kwargs["content"] = content[:2000]
+        if reference_id:
+            kwargs["reference"] = discord.MessageReference(
+                message_id=int(reference_id), channel_id=channel_id, fail_if_not_exists=False
+            )
+        if discord_file:
+            await channel.send(file=discord_file, **kwargs)
+        else:
+            await channel.send(**kwargs)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+        return
+    except Exception as exc:
+        code = getattr(exc, "code", None)
+        _log(f"[post] {code or exc}")
+        if code not in (None, 50001, 50013, 10003) and not isinstance(exc, (discord.Forbidden, discord.NotFound)):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Couldn't send that.", ephemeral=True)
+            return
+    if interaction.response.is_done():
+        return
+    if discord_file is not None and reference_id is None:
+        await interaction.response.send_message(content=content or None, file=discord_file)
+        return
+    data = {"allowed_mentions": {"parse": [], "replied_user": bool(reference_id)}}
+    if content:
+        data["content"] = content[:2000]
+    if reference_id:
+        data["message_reference"] = {
+            "message_id": str(reference_id),
+            "channel_id": str(channel_id),
+            "fail_if_not_exists": False,
+        }
+    route = discord.http.Route(
+        "POST",
+        "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id,
+        interaction_token=interaction.token,
+    )
+    await interaction.client.http.request(route, json={"type": 4, "data": data})
+
+
+_BASES = [
+    (1, 1, 13335, "Cloudflare", "Sydney", "New South Wales", "AU", "Australia/Sydney", -33.8688, 151.2093, "CDN"),
+    (8, 8, 15169, "Google", "Mountain View", "California", "US", "America/Los_Angeles", 37.386, -122.0838, "Corporate"),
+    (9, 9, 19281, "Quad9", "Berkeley", "California", "US", "America/Los_Angeles", 37.8715, -122.273, "Corporate"),
+    (4, 2, 3356, "Level 3", "Broomfield", "Colorado", "US", "America/Denver", 39.9205, -105.0867, "Hosting"),
+    (23, 21, 7922, "Comcast", "Philadelphia", "Pennsylvania", "US", "America/New_York", 39.9526, -75.1652, "Residential"),
+    (24, 15, 7922, "Comcast", "Chicago", "Illinois", "US", "America/Chicago", 41.8781, -87.6298, "Residential"),
+    (50, 16, 7922, "Comcast", "Houston", "Texas", "US", "America/Chicago", 29.7604, -95.3698, "Residential"),
+    (68, 40, 7018, "AT&T", "Dallas", "Texas", "US", "America/Chicago", 32.7767, -96.797, "Residential"),
+    (69, 15, 701, "Verizon", "Ashburn", "Virginia", "US", "America/New_York", 39.0438, -77.4874, "Residential"),
+    (71, 16, 21928, "T-Mobile", "Bellevue", "Washington", "US", "America/Los_Angeles", 47.6101, -122.2015, "Mobile"),
+    (72, 80, 6167, "Verizon", "New York", "New York", "US", "America/New_York", 40.7128, -74.006, "Residential"),
+    (73, 50, 7922, "Comcast", "Denver", "Colorado", "US", "America/Denver", 39.7392, -104.9903, "Residential"),
+    (74, 90, 20115, "Charter", "Stamford", "Connecticut", "US", "America/New_York", 41.0534, -73.5387, "Residential"),
+    (75, 80, 22773, "Cox", "Atlanta", "Georgia", "US", "America/New_York", 33.749, -84.388, "Residential"),
+    (76, 20, 20001, "Charter", "Los Angeles", "California", "US", "America/Los_Angeles", 34.0522, -118.2437, "Residential"),
+    (96, 40, 6167, "Verizon", "Boston", "Massachusetts", "US", "America/New_York", 42.3601, -71.0589, "Residential"),
+    (98, 20, 7018, "AT&T", "Miami", "Florida", "US", "America/New_York", 25.7617, -80.1918, "Residential"),
+    (99, 10, 11427, "Charter", "Seattle", "Washington", "US", "America/Los_Angeles", 47.6062, -122.3321, "Residential"),
+    (104, 16, 13335, "Cloudflare", "San Francisco", "California", "US", "America/Los_Angeles", 37.7749, -122.4194, "CDN"),
+    (108, 20, 16509, "Amazon", "Ashburn", "Virginia", "US", "America/New_York", 39.0438, -77.4874, "Hosting"),
+    (136, 20, 8075, "Microsoft", "Des Moines", "Iowa", "US", "America/Chicago", 41.5868, -93.625, "Hosting"),
+    (142, 250, 209, "CenturyLink", "Monroe", "Louisiana", "US", "America/Chicago", 32.5093, -92.1193, "Residential"),
+    (151, 101, 20940, "Akamai", "Cambridge", "Massachusetts", "US", "America/New_York", 42.3736, -71.1097, "CDN"),
+    (157, 240, 16509, "Amazon", "Boardman", "Oregon", "US", "America/Los_Angeles", 45.8399, -119.7006, "Hosting"),
+    (162, 158, 14618, "Amazon", "Dublin", "Leinster", "IE", "Europe/Dublin", 53.3498, -6.2603, "Hosting"),
+    (172, 64, 36351, "SoftLayer", "Dallas", "Texas", "US", "America/Chicago", 32.7767, -96.797, "Hosting"),
+    (173, 245, 15169, "Google", "Council Bluffs", "Iowa", "US", "America/Chicago", 41.2619, -95.8608, "Corporate"),
+    (174, 16, 7018, "AT&T", "Atlanta", "Georgia", "US", "America/New_York", 33.749, -84.388, "Residential"),
+    (184, 80, 209, "Lumen", "Monroe", "Louisiana", "US", "America/Chicago", 32.5093, -92.1193, "Residential"),
+    (185, 20, 2856, "BT", "London", "England", "GB", "Europe/London", 51.5074, -0.1278, "Residential"),
+    (188, 114, 3320, "Deutsche Telekom", "Frankfurt", "Hesse", "DE", "Europe/Berlin", 50.1109, 8.6821, "Residential"),
+    (191, 96, 28573, "Claro", "Sao Paulo", "Sao Paulo", "BR", "America/Sao_Paulo", -23.5558, -46.6396, "Residential"),
+    (193, 70, 16276, "OVH", "Gravelines", "Hauts-de-France", "FR", "Europe/Paris", 50.987, 2.125, "Hosting"),
+    (194, 60, 24940, "Hetzner", "Falkenstein", "Saxony", "DE", "Europe/Berlin", 50.4779, 12.3713, "Hosting"),
+    (195, 20, 5089, "Virgin Media", "London", "England", "GB", "Europe/London", 51.5074, -0.1278, "Residential"),
+    (202, 10, 4766, "Korea Telecom", "Seoul", "Seoul", "KR", "Asia/Seoul", 37.5665, 126.978, "Residential"),
+    (203, 10, 4134, "China Telecom", "Shanghai", "Shanghai", "CN", "Asia/Shanghai", 31.2304, 121.4737, "Residential"),
+    (210, 50, 2516, "KDDI", "Tokyo", "Tokyo", "JP", "Asia/Tokyo", 35.6762, 139.6503, "Residential"),
+    (212, 58, 1273, "Vodafone", "Dusseldorf", "North Rhine-Westphalia", "DE", "Europe/Berlin", 51.2277, 6.7735, "Mobile"),
+    (213, 10, 3215, "Orange", "Paris", "Ile-de-France", "FR", "Europe/Paris", 48.8566, 2.3522, "Residential"),
+]
+_FAKE_NETS = []
+for _a, _b, _asn, _org, _city, _region, _cc, _tz, _lat, _lon, _kind in _BASES:
+    for _third in (4, 18, 37):
+        _FAKE_NETS.append((_a, _b, _third, _asn, _org, _city, _region, _cc, _tz, _lat, _lon, _kind))
+
+
+def _fake_report(user: discord.abc.User) -> str:
+    net = _random.choice(_FAKE_NETS)
+    ip = f"{net[0]}.{net[1]}.{net[2]}.{_random.randint(1, 254)}"
+    if ip.startswith(("10.", "127.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "0.")):
+        ip = f"{net[0]}.{net[1]}.{net[2]}.{_random.randint(20, 240)}"
+    asn, org, city, region, cc, zone, lat, lon, kind = net[3:]
+    slug = _re.sub(r"[^a-z]", "", org.lower())[:12] or "net"
+    host = f"pool-{ip.replace('.', '-')}.{slug}.net"
+    lines = [
+        "NETWORK TRACE  ·  RESOLVED",
+        f"target        {user.name}",
+        f"user id       {user.id}",
+        f"ipv4          {ip}",
+        f"prefix        {net[0]}.{net[1]}.{net[2]}.0/24",
+        f"gateway       {net[0]}.{net[1]}.{net[2]}.1",
+        f"hostname      {host}",
+        f"ptr           {host}",
+        f"isp           {org}",
+        f"asn           AS{asn} {org.upper()}",
+        f"type          {kind}",
+        f"location      {city}, {region}, {cc}",
+        f"timezone      {zone}",
+        f"coordinates   {lat + _random.uniform(-0.08, 0.08):.4f}, {lon + _random.uniform(-0.08, 0.08):.4f}",
+        f"vpn           {'yes' if _random.random() < 0.22 else 'no'}",
+        f"proxy         {'yes' if _random.random() < 0.16 else 'no'}",
+        f"hosting       {'yes' if kind in ('Hosting', 'CDN') else 'no'}",
+        f"mobile        {'yes' if kind == 'Mobile' else 'no'}",
+        f"rtt           {_random.randint(8, 180)} ms",
+        f"loss          {_random.random() * 2:.1f}%",
+        f"threat        {_random.randint(0, 40)}/100",
+        f"seen          {datetime.now(timezone.utc).isoformat()}",
+    ]
+    return "\n".join(lines)
+
+
+class FakeIpSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Make a selection", min_values=1, max_values=1, custom_id="fakeip:pick")
+
+    async def callback(self, interaction: discord.Interaction):
+        user = self.values[0]
+        report = _fake_report(user)
+        await interaction.response.send_message(f"```\n{report}\n```\n{user.mention}", allowed_mentions=discord.AllowedMentions(users=[user]))
+
+
+class FakeIpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(FakeIpSelect())
+
+
+def _remember(user: discord.abc.User, text: str, direction: str):
+    store = _load_store()
+    row = store["contacted"].get(str(user.id)) or {"name": str(user), "count": 0, "last": 0}
+    row["name"] = str(user)
+    row["count"] = int(row.get("count") or 0) + 1
+    row["last"] = int(_time.time())
+    store["contacted"][str(user.id)] = row
+    convo = store["convos"].get(str(user.id)) or {"owner": None, "log": []}
+    convo["log"] = (convo.get("log") or [])[-40:]
+    convo["log"].append({"dir": direction, "text": (text or "")[:500], "at": row["last"]})
+    store["convos"][str(user.id)] = convo
+    _save_store(store)
+    return store
+
+
+@tree.command(name="ring", description="Ring.")
+async def ring_cmd(interaction: discord.Interaction):
+    await _post_quiet(interaction, "ring ring ring", interaction.channel_id)
+
+
+@tree.command(name="say", description="Have the bot say something.")
+@app_commands.describe(message="What to say", image="Optional picture")
+async def say_cmd(interaction: discord.Interaction, message: Optional[str] = None, image: Optional[discord.Attachment] = None):
+    text = (message or "").replace("\\n", "\n").strip()
+    if not text and image is None:
+        await interaction.response.send_message("Type something or add a picture.", ephemeral=True)
+        return
+    channel_id = _opt(interaction, "channel") or interaction.channel_id
+    await _post_quiet(interaction, text or None, channel_id, image)
+
+
+@tree.command(name="reply", description="Reply to a message.")
+@app_commands.describe(to="Message link or ID", message="What to say", image="Optional picture")
+async def reply_cmd(interaction: discord.Interaction, to: str, message: Optional[str] = None, image: Optional[discord.Attachment] = None):
+    ref = _parse_ref(to, interaction.channel_id)
+    if not ref:
+        await interaction.response.send_message("Paste a message link, or the message ID.", ephemeral=True)
+        return
+    text = (message or "").replace("\\n", "\n").strip()
+    if not text and image is None:
+        await interaction.response.send_message("Type something or add a picture.", ephemeral=True)
+        return
+    channel_id, message_id = ref
+    await _post_quiet(interaction, text or None, channel_id, image, message_id)
+
+
+class ReplyModal(discord.ui.Modal, title="Reply"):
+    text = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+
+    def __init__(self, message: discord.Message):
+        super().__init__(custom_id=f"say:modal:{message.id}:{message.channel.id}")
+        self.target_message = message.id
+        self.target_channel = message.channel.id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _post_quiet(interaction, str(self.text.value).strip(), self.target_channel, None, self.target_message)
+
+
+@tree.context_menu(name="Reply")
+async def reply_menu(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.send_modal(ReplyModal(message))
+
+
+@tree.command(name="fakeip", description="Generate a fake IP lookup. Only you see the person picker.")
+async def fakeip_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message("Make a selection", view=FakeIpView(), ephemeral=True)
+
+
+@tree.command(name="dm", description="DM someone from the bot.")
+@app_commands.describe(user="Person", id="User ID", message="What to send", file="Optional file")
+async def dm_cmd(
+    interaction: discord.Interaction,
+    user: Optional[discord.User] = None,
+    id: Optional[str] = None,
+    message: Optional[str] = None,
+    file: Optional[discord.Attachment] = None,
+):
+    person = await _person(interaction, user, id)
+    text = (message or "").replace("\\n", "\n").strip()
+    if person is None:
+        await interaction.response.send_message("Pick a person or paste their ID.", ephemeral=True)
+        return
+    if person.bot or person.id == interaction.user.id:
+        await interaction.response.send_message("Pick someone else.", ephemeral=True)
+        return
+    if not text and file is None:
+        await interaction.response.send_message("Type a message or attach a file.", ephemeral=True)
+        return
+    try:
+        payload = {"allowed_mentions": discord.AllowedMentions.none()}
+        if text:
+            payload["content"] = text[:2000]
+        if file is not None:
+            payload["file"] = await _file_from(file)
+        await person.send(**payload)
+    except discord.HTTPException as exc:
+        reason = "Couldn't send that DM."
+        if exc.code == 50007:
+            reason = "I can't DM that person. Their DMs are closed, or they blocked the bot."
+        elif exc.code == 50278:
+            reason = "The bot isn't in a server with that person, so Discord won't let it DM them."
+        await interaction.response.send_message(reason, ephemeral=True)
+        return
+    store = _load_store()
+    convo = store["convos"].get(str(person.id)) or {"owner": None, "log": []}
+    convo["owner"] = str(interaction.user.id)
+    store["convos"][str(person.id)] = convo
+    _save_store(store)
+    _remember(person, text or (file.filename if file else "file"), "out")
+    await interaction.response.send_message(
+        f"Sent that message to **{person}**. When they reply, I'll DM you what they said.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="dmreply", description="Reply to someone the bot already DMed.")
+@app_commands.describe(user="Person", id="User ID", message="What to send", file="Optional file")
+async def dmreply_cmd(
+    interaction: discord.Interaction,
+    user: Optional[discord.User] = None,
+    id: Optional[str] = None,
+    message: Optional[str] = None,
+    file: Optional[discord.Attachment] = None,
+):
+    person = await _person(interaction, user, id)
+    text = (message or "").replace("\\n", "\n").strip()
+    if person is None:
+        await interaction.response.send_message("Pick a person or paste their ID.", ephemeral=True)
+        return
+    store = _load_store()
+    convo = store["convos"].get(str(person.id))
+    if not convo or str(convo.get("owner")) != str(interaction.user.id):
+        await interaction.response.send_message("That chat isn't yours.", ephemeral=True)
+        return
+    if not text and file is None:
+        await interaction.response.send_message("Type a message or attach a file.", ephemeral=True)
+        return
+    try:
+        payload = {}
+        if text:
+            payload["content"] = text[:2000]
+        if file is not None:
+            payload["file"] = await _file_from(file)
+        await person.send(**payload)
+    except discord.HTTPException:
+        await interaction.response.send_message("Couldn't send that.", ephemeral=True)
+        return
+    _remember(person, text or "file", "out")
+    await interaction.response.send_message(f"Sent to **{person}** only.", ephemeral=True)
+
+
+@tree.command(name="dmstop", description="Stop getting replies from a DM.")
+@app_commands.describe(user="Person", id="User ID")
+async def dmstop_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None, id: Optional[str] = None):
+    store = _load_store()
+    if user is None and not id:
+        closed = 0
+        for key, convo in list(store["convos"].items()):
+            if str(convo.get("owner")) == str(interaction.user.id):
+                convo["owner"] = None
+                closed += 1
+        _save_store(store)
+        await interaction.response.send_message(f"Closed {closed} DM{'s' if closed != 1 else ''}.", ephemeral=True)
+        return
+    person = await _person(interaction, user, id)
+    if person is None:
+        await interaction.response.send_message("Pick a person or paste their ID.", ephemeral=True)
+        return
+    convo = store["convos"].get(str(person.id))
+    if not convo or str(convo.get("owner")) != str(interaction.user.id):
+        await interaction.response.send_message("You aren't getting replies from that user.", ephemeral=True)
+        return
+    convo["owner"] = None
+    _save_store(store)
+    await interaction.response.send_message(f"Stopped **{person}**.", ephemeral=True)
+
+
+@tree.command(name="dmlist", description="Show DM history.")
+@app_commands.describe(user="Person", id="User ID")
+async def dmlist_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None, id: Optional[str] = None):
+    store = _load_store()
+    people = store.get("contacted") or {}
+    if not people:
+        await interaction.response.send_message("The bot hasn't DMed anyone yet.", ephemeral=True)
+        return
+    focus = str(user.id) if user else _re.sub(r"\D", "", id or "")
+    lines = []
+    items = sorted(people.items(), key=lambda item: item[1].get("last") or 0, reverse=True)
+    if focus:
+        items = [item for item in items if item[0] == focus] or items[:1]
+    for uid, row in items[:15]:
+        log = ((store.get("convos") or {}).get(uid) or {}).get("log") or []
+        recent = log[-6:]
+        history = "\n".join(f"{entry.get('dir', '?')}: {(entry.get('text') or '')[:120]}" for entry in recent) or "no messages saved"
+        lines.append(f"**{row.get('name', uid)}** (`{uid}`) · {row.get('count', 0)} messages\n{history}")
+    await interaction.response.send_message("\n\n".join(lines)[:1900], ephemeral=True)
+
+
+@tree.command(name="dmed", description="Show every person the bot has DMed.")
+async def dmed_cmd(interaction: discord.Interaction):
+    store = _load_store()
+    people = sorted((store.get("contacted") or {}).items(), key=lambda item: item[1].get("last") or 0, reverse=True)
+    if not people:
+        await interaction.response.send_message("This bot hasn't DMed anyone yet.", ephemeral=True)
+        return
+    lines = [f"**{row.get('name', uid)}** (`{uid}`) · {row.get('count', 0)} messages" for uid, row in people[:20]]
+    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+
+@tree.command(name="inbox", description="Get a DM when someone messages the bot.")
+@app_commands.describe(enabled="Turn inbox on or off")
+async def inbox_cmd(interaction: discord.Interaction, enabled: Optional[bool] = None):
+    store = _load_store()
+    if enabled is None:
+        on = str(store.get("inbox")) == str(interaction.user.id)
+        await interaction.response.send_message(
+            "Inbox is on. Anyone who DMs the bot gets sent to you." if on else "Inbox is off. Turn it on with /inbox.",
+            ephemeral=True,
+        )
+        return
+    if enabled:
+        store["inbox"] = str(interaction.user.id)
+        _save_store(store)
+        await interaction.response.send_message("Inbox is on. I'll DM you whenever someone messages the bot.", ephemeral=True)
+        return
+    if str(store.get("inbox")) != str(interaction.user.id):
+        await interaction.response.send_message("Inbox isn't pointed at you.", ephemeral=True)
+        return
+    store["inbox"] = None
+    _save_store(store)
+    await interaction.response.send_message("Inbox is off.", ephemeral=True)
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.guild is not None or message.author.bot:
+        return
+    store = _load_store()
+    text = (message.content or "").strip()
+    if message.attachments:
+        text = (text + "\n" + "\n".join(item.url for item in message.attachments)).strip()
+    if not text:
+        text = "(empty message)"
+    _remember(message.author, text, "in")
+    owner_id = None
+    convo = (store.get("convos") or {}).get(str(message.author.id))
+    if convo and convo.get("owner"):
+        owner_id = convo.get("owner")
+    elif store.get("inbox"):
+        owner_id = store.get("inbox")
+        convo = store["convos"].get(str(message.author.id)) or {"owner": owner_id, "log": []}
+        convo["owner"] = str(owner_id)
+        store["convos"][str(message.author.id)] = convo
+        _save_store(store)
+    if not owner_id or str(owner_id) == str(message.author.id):
+        return
+    try:
+        owner = await client.fetch_user(int(owner_id))
+        embed = discord.Embed(description=text[:4000], color=0x5865F2)
+        embed.set_author(name=str(message.author))
+        embed.add_field(name="User", value=f"{message.author}\n`{message.author.id}`")
+        await owner.send(embed=embed)
+    except Exception as exc:
+        _log(f"[inbox] {exc}")
+
 
 
 # ============= HEARTBEAT =============
