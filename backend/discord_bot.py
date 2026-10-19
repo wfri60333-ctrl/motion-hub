@@ -262,7 +262,7 @@ async def on_ready():
         client.add_view(ScriptPanel())
     except Exception as e:
         _log(f"[persistent-view] failed: {e}")
-    try:
+    
         
 
 
