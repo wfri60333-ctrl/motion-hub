@@ -294,7 +294,7 @@ async def _sync_commands():
         return
     _SYNCED = True
     try:
-        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox", "chaos"}
+        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox", "chaos", "ping"}
         for cmd in list(tree.get_commands()):
             if cmd.name.lower() not in keep:
                 tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
@@ -2698,6 +2698,190 @@ async def chaos_cmd(
         color=0xED4245,
     )
     await interaction.followup.send(content=sample, embed=embed, view=view, ephemeral=True)
+
+
+_PING_STATUS = {
+    "any": "Any",
+    "online": "Online",
+    "idle": "Idle",
+    "dnd": "Do Not Disturb",
+    "offline": "Offline",
+}
+
+
+def _member_status(member) -> str:
+    status = getattr(member, "status", None)
+    value = str(getattr(status, "value", status) or "offline")
+    if value == "invisible":
+        return "offline"
+    return value
+
+
+def _ping_line(user_id: int, note: str) -> str:
+    line = f"<@{user_id}>"
+    if note:
+        line = f"{line} {note}"
+    return line[:2000]
+
+
+class PingSend(discord.ui.View):
+    def __init__(self, lines, channel_id):
+        super().__init__(timeout=180)
+        self.lines = list(lines)
+        self.channel_id = int(channel_id)
+        self.owner_id = None
+        self.token = None
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    async def _mark(self, interaction: discord.Interaction, text: str):
+        try:
+            route = discord.http.Route(
+                "PATCH",
+                "/webhooks/{application_id}/{interaction_token}/messages/@original",
+                application_id=APP_ID or interaction.application_id,
+                interaction_token=self.token,
+            )
+            await interaction.client.http.request(
+                route, json={"content": text, "components": [], "embeds": [], "attachments": []}
+            )
+        except Exception as exc:
+            _log(f"[ping-edit] {exc}")
+
+    @discord.ui.button(label="Send", style=discord.ButtonStyle.primary)
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
+        count = len(self.lines)
+        word = "ping" if count == 1 else "pings"
+        channel = interaction.client.get_channel(self.channel_id)
+        if channel is None:
+            await interaction.response.send_message(self.lines[0], allowed_mentions=mentions)
+            for line in self.lines[1:]:
+                await asyncio.sleep(0.6)
+                await interaction.followup.send(line, allowed_mentions=mentions)
+            await self._mark(interaction, f"Sent {count} {word} publicly")
+            return
+        await interaction.response.edit_message(content=f"Sending {count} {word}...", embed=None, view=None)
+        sent = 0
+        for index, line in enumerate(self.lines):
+            try:
+                await channel.send(line, allowed_mentions=mentions)
+                sent += 1
+            except discord.HTTPException as exc:
+                if getattr(exc, "status", None) == 429:
+                    await asyncio.sleep(1.6)
+                    try:
+                        await channel.send(line, allowed_mentions=mentions)
+                        sent += 1
+                    except Exception as again:
+                        _log(f"[ping] {again}")
+                        break
+                else:
+                    _log(f"[ping] {exc}")
+                    break
+            except Exception as exc:
+                _log(f"[ping] {exc}")
+                break
+            if index + 1 < count:
+                await asyncio.sleep(0.6)
+        done = "ping" if sent == 1 else "pings"
+        try:
+            await interaction.edit_original_response(content=f"Sent {sent} {done} publicly")
+        except Exception as exc:
+            _log(f"[ping-edit] {exc}")
+
+
+@tree.command(name="ping", description="Ping a person or random people. Only you see it until you press Send.")
+@app_commands.describe(
+    mode="One person, or random people",
+    times="How many pings to send",
+    user="Person to ping",
+    status="For random: any, online, idle, do not disturb, or offline",
+    text="Optional text after the ping",
+    channel_id="Optional channel ID",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="One user", value="user"),
+        app_commands.Choice(name="Random users", value="random"),
+    ],
+    times=[
+        app_commands.Choice(name="1", value=1),
+        app_commands.Choice(name="5", value=5),
+        app_commands.Choice(name="10", value=10),
+    ],
+    status=[app_commands.Choice(name=label, value=key) for key, label in _PING_STATUS.items()],
+)
+async def ping_cmd(
+    interaction: discord.Interaction,
+    mode: str,
+    times: int,
+    user: Optional[discord.User] = None,
+    status: str = "any",
+    text: Optional[str] = None,
+    channel_id: Optional[str] = None,
+):
+    if mode not in ("user", "random") or times not in (1, 5, 10) or status not in _PING_STATUS:
+        await interaction.response.send_message("Pick who to ping, and 1, 5, or 10.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    note = (text or "").replace("\\n", "\n").strip()
+    target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
+    chosen = []
+    if mode == "user":
+        if user is None:
+            await interaction.followup.send("Pick a user.", ephemeral=True)
+            return
+        chosen = [user for _ in range(times)]
+        detail = f"{user} · {times} time{'s' if times != 1 else ''}"
+    else:
+        guild = interaction.guild
+        if guild is None and target:
+            cached = interaction.client.get_channel(int(target))
+            guild = getattr(cached, "guild", None)
+        if guild is None:
+            await interaction.followup.send("Random only works in a server the bot is in.", ephemeral=True)
+            return
+        try:
+            if not getattr(guild, "chunked", True):
+                await asyncio.wait_for(guild.chunk(), timeout=2)
+        except Exception as exc:
+            _log(f"[ping] {exc}")
+        pool = [
+            member
+            for member in guild.members
+            if member is not None and not member.bot and _member_status(member) and (status == "any" or _member_status(member) == status)
+        ]
+        if not pool:
+            await interaction.followup.send(
+                f"No cached members are {_PING_STATUS[status].lower()}. Random status needs Server Members Intent and Presence Intent turned on for this bot.",
+                ephemeral=True,
+            )
+            return
+        if len(pool) >= times:
+            chosen = _random.sample(pool, times)
+        else:
+            chosen = [_random.choice(pool) for _ in range(times)]
+        detail = f"Random · {_PING_STATUS[status]} · {times} ping{'s' if times != 1 else ''} · {len(pool)} people match"
+    lines = [_ping_line(person.id, note) for person in chosen]
+    view = PingSend(lines, target)
+    view.owner_id = interaction.user.id
+    view.token = interaction.token
+    embed = discord.Embed(title="Ping", description=f"{detail}\nOnly you can see this.", color=0x5865F2)
+    preview = "\n".join(lines)
+    if len(preview) > 1900:
+        preview = preview[:1900]
+    await interaction.followup.send(
+        content=preview,
+        embed=embed,
+        view=view,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @tree.command(name="reply", description="Reply to a message. Nobody sees who used it.")
