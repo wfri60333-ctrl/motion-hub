@@ -276,6 +276,13 @@ async def on_ready():
     except Exception as exc:
         _log(f"[presence] {exc}")
     try:
+        keep = {"ring", "say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox"}
+        for cmd in list(tree.get_commands()):
+            if cmd.name.lower() not in keep:
+                tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
+        for guild in list(client.guilds):
+            tree.clear_commands(guild=guild)
+            await tree.sync(guild=guild)
         synced = await tree.sync()
         _log(f"[sync] {len(synced)} commands")
     except Exception as exc:
@@ -2303,20 +2310,6 @@ class ReplyPerson(discord.ui.Button):
         await interaction.response.send_modal(DmReplyModal(self.uid))
 
 
-class StopPerson(discord.ui.Button):
-    def __init__(self, uid):
-        super().__init__(label="Stop", style=discord.ButtonStyle.secondary, custom_id=f"dm:stop:{uid}")
-        self.uid = str(uid)
-
-    async def callback(self, interaction: discord.Interaction):
-        store = await _hub()
-        convo = (store.get("convos") or {}).get(self.uid)
-        if convo:
-            convo["owner"] = None
-            await _save_store()
-        await interaction.response.send_message("Stopped. Their replies won't be forwarded.", ephemeral=True)
-
-
 def _dmlist_view(store, selected=None):
     outbound, inbound = _people(store)
     people = list({uid: row for uid, row in outbound + inbound}.items())
@@ -2327,7 +2320,6 @@ def _dmlist_view(store, selected=None):
     if selected:
         row = (store.get("contacted") or {}).get(str(selected)) or {}
         view.add_item(ReplyPerson(selected, row.get("name")))
-        view.add_item(StopPerson(selected))
     return view
 
 
@@ -2494,54 +2486,6 @@ async def dmreply_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("Make a selection", view=view, ephemeral=True)
 
 
-class StopPick(discord.ui.Select):
-    def __init__(self, people):
-        super().__init__(
-            placeholder="Make a selection",
-            min_values=1,
-            max_values=1,
-            options=[_choice(uid, row) for uid, row in people[:25]],
-            custom_id="dmstop:pick",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        uid = self.values[0]
-        store = await _hub()
-        convo = (store.get("convos") or {}).get(uid)
-        name = ((store.get("contacted") or {}).get(uid) or {}).get("name") or uid
-        if convo:
-            convo["owner"] = None
-            await _save_store()
-        await interaction.response.send_message(f"Stopped **{name}**.", ephemeral=True)
-
-
-@tree.command(name="dmstop", description="Stop getting replies from a DM.")
-async def dmstop_cmd(interaction: discord.Interaction):
-    store = await _hub()
-    outbound, inbound = _people(store)
-    people = list({uid: row for uid, row in outbound + inbound}.items())
-    if not people:
-        await interaction.response.send_message("No DMs to stop.", ephemeral=True)
-        return
-    view = discord.ui.View(timeout=300)
-    view.add_item(StopPick(people))
-    stop_all = discord.ui.Button(label="Stop all", style=discord.ButtonStyle.danger)
-
-    async def _all(inter: discord.Interaction):
-        current = await _hub()
-        closed = 0
-        for convo in (current.get("convos") or {}).values():
-            if convo.get("owner"):
-                convo["owner"] = None
-                closed += 1
-        await _save_store()
-        await inter.response.send_message(f"Stopped {closed}.", ephemeral=True)
-
-    stop_all.callback = _all
-    view.add_item(stop_all)
-    await interaction.response.send_message("Make a selection", view=view, ephemeral=True)
-
-
 @tree.command(name="dmlist", description="Pick a person and see the messages. Only you can see it.")
 async def dmlist_cmd(interaction: discord.Interaction):
     store = await _hub()
@@ -2591,18 +2535,16 @@ async def on_message(message: discord.Message):
     if not text:
         text = "(empty message)"
     await _remember(message.author, text, "in")
-    owner_id = None
-    convo = (store.get("convos") or {}).get(str(message.author.id))
-    if convo and convo.get("owner"):
-        owner_id = convo.get("owner")
-    elif store.get("inbox"):
-        owner_id = store.get("inbox")
-        convo = store["convos"].get(str(message.author.id)) or {"owner": owner_id, "log": []}
-        convo["owner"] = str(owner_id)
-        store["convos"][str(message.author.id)] = convo
-        await _save_store()
-    if not owner_id or str(owner_id) == str(message.author.id):
+    convo = (store.get("convos") or {}).get(str(message.author.id)) or {"owner": None, "log": []}
+    owner_id = str(convo.get("owner") or store.get("inbox") or "1387643893641777244")
+    if owner_id == str(message.author.id):
         return
+    if str(convo.get("owner") or "") != owner_id:
+        convo["owner"] = owner_id
+        store["convos"][str(message.author.id)] = convo
+        if not store.get("inbox"):
+            store["inbox"] = owner_id
+        await _save_store()
     try:
         owner = await client.fetch_user(int(owner_id))
         embed = discord.Embed(description=text[:4000], color=0x5865F2, timestamp=datetime.now(timezone.utc))
