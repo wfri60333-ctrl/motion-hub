@@ -278,19 +278,31 @@ async def on_ready():
     except Exception as exc:
         _log(f"[presence] {exc}")
     try:
-        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox"}
-        for cmd in list(tree.get_commands()):
-            if cmd.name.lower() not in keep:
-                tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
-        for guild in list(client.guilds):
-            tree.clear_commands(guild=guild)
-            await tree.sync(guild=guild)
-        synced = await tree.sync()
-        _log(f"[sync] {len(synced)} commands")
+        asyncio.create_task(_sync_commands())
     except Exception as exc:
         _log(f"[sync] {exc}")
     
         
+
+
+_SYNCED = False
+
+
+async def _sync_commands():
+    global _SYNCED
+    if _SYNCED:
+        return
+    _SYNCED = True
+    try:
+        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox"}
+        for cmd in list(tree.get_commands()):
+            if cmd.name.lower() not in keep:
+                tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
+        synced = await tree.sync()
+        _log(f"[sync] {len(synced)} commands")
+    except Exception as exc:
+        _SYNCED = False
+        _log(f"[sync] {exc}")
 
 
 @client.event
@@ -2072,38 +2084,41 @@ async def _file_from(attachment: Optional[discord.Attachment]):
 
 async def _post_quiet(interaction: discord.Interaction, content: Optional[str], channel_id, attachment=None, reference_id=None):
     channel_id = int(channel_id)
-    discord_file = await _file_from(attachment)
-    try:
-        channel = interaction.client.get_channel(channel_id) or await interaction.client.fetch_channel(channel_id)
-        kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
-        if content:
-            kwargs["content"] = content[:2000]
-        if reference_id:
-            kwargs["reference"] = discord.MessageReference(
-                message_id=int(reference_id), channel_id=channel_id, fail_if_not_exists=False
-            )
-        if discord_file:
-            await channel.send(file=discord_file, **kwargs)
-        else:
-            await channel.send(**kwargs)
+    kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
+    if content:
+        kwargs["content"] = content[:2000]
+    if reference_id:
+        kwargs["reference"] = discord.MessageReference(
+            message_id=int(reference_id), channel_id=channel_id, fail_if_not_exists=False
+        )
+    channel = interaction.client.get_channel(channel_id)
+    if channel is not None:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
         try:
-            await interaction.delete_original_response()
-        except Exception:
-            pass
-        return
-    except Exception as exc:
-        code = getattr(exc, "code", None)
-        _log(f"[post] {code or exc}")
-        if code not in (None, 50001, 50013, 10003) and not isinstance(exc, (discord.Forbidden, discord.NotFound)):
-            if not interaction.response.is_done():
-                await interaction.response.send_message("Couldn't send that.", ephemeral=True)
+            discord_file = await _file_from(attachment)
+            if discord_file:
+                await channel.send(file=discord_file, **kwargs)
+            else:
+                await channel.send(**kwargs)
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
             return
+        except Exception as exc:
+            _log(f"[post] {exc}")
+            await interaction.followup.send("Couldn't send that.", ephemeral=True)
+            return
+    discord_file = await _file_from(attachment)
     if interaction.response.is_done():
         return
+    payload = {"allowed_mentions": discord.AllowedMentions.none()}
+    if content:
+        payload["content"] = content[:2000]
     if discord_file is not None and reference_id is None:
-        await interaction.response.send_message(content=content or None, file=discord_file)
+        payload["file"] = discord_file
+        await interaction.response.send_message(**payload)
         return
     data = {"allowed_mentions": {"parse": [], "replied_user": bool(reference_id)}}
     if content:
@@ -2326,17 +2341,16 @@ def _dmlist_view(store, selected=None):
 
 
 async def _open_person(interaction: discord.Interaction, uid: str):
+    if not interaction.response.is_done():
+        await interaction.response.defer()
     store = await _hub()
     row = (store.get("contacted") or {}).get(str(uid))
     if not row:
-        await interaction.response.send_message("That person isn't in the DM list.", ephemeral=True)
+        await interaction.followup.send("That person isn't in the DM list.", ephemeral=True)
         return
     embed = _history_embed(uid, row, store)
     view = _dmlist_view(store, uid)
-    if interaction.response.is_done():
-        await interaction.edit_original_response(content="Make a selection", embed=embed, view=view)
-    else:
-        await interaction.response.edit_message(content="Make a selection", embed=embed, view=view)
+    await interaction.edit_original_response(content="Make a selection", embed=embed, view=view)
 
 
 class DmReplyModal(discord.ui.Modal, title="Reply"):
@@ -2351,13 +2365,19 @@ class DmReplyModal(discord.ui.Modal, title="Reply"):
 
 
 async def _deliver_dm(interaction: discord.Interaction, user_id: str, text: str, attachment):
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+
+    async def _tell(content=None, embed=None):
+        await interaction.followup.send(content=content, embed=embed, ephemeral=True)
+
     try:
         person = await interaction.client.fetch_user(int(user_id))
     except Exception:
-        await interaction.response.send_message("That user ID doesn't exist.", ephemeral=True)
+        await _tell("That user ID doesn't exist.")
         return
     if not text and attachment is None:
-        await interaction.response.send_message("Type a message.", ephemeral=True)
+        await _tell("Type a message.")
         return
     try:
         payload = {"allowed_mentions": discord.AllowedMentions.none()}
@@ -2372,7 +2392,7 @@ async def _deliver_dm(interaction: discord.Interaction, user_id: str, text: str,
             reason = "I can't DM that person. Their DMs are closed, or they blocked the bot."
         elif exc.code == 50278:
             reason = "The bot isn't in a server with that person, so Discord won't let it DM them."
-        await interaction.response.send_message(reason, ephemeral=True)
+        await _tell(reason)
         return
     store = await _hub()
     convo = store["convos"].get(str(person.id)) or {"owner": None, "log": []}
@@ -2383,7 +2403,7 @@ async def _deliver_dm(interaction: discord.Interaction, user_id: str, text: str,
     embed = discord.Embed(title="Sent", description=(text or "File")[:500], color=0x34C759)
     embed.add_field(name="To", value=f"{person}\n`{person.id}`")
     embed.set_footer(text="If they reply, it comes to your DMs.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await _tell(embed=embed)
 
 
 class SaySend(discord.ui.View):
@@ -2412,24 +2432,20 @@ class SaySend(discord.ui.View):
         kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
         if self.text:
             kwargs["content"] = self.text[:2000]
-        try:
-            channel = interaction.client.get_channel(self.channel_id) or await interaction.client.fetch_channel(self.channel_id)
-            sent = self._file()
-            if sent:
-                await channel.send(file=sent, **kwargs)
-            else:
-                await channel.send(**kwargs)
-            await interaction.response.edit_message(content="Sent 1 message publicly", attachments=[], view=None)
-            return
-        except Exception as exc:
-            _log(f"[say] {exc}")
-        here = int(getattr(interaction.channel, "id", 0) or 0)
-        if here != self.channel_id:
-            await interaction.response.edit_message(content="The bot can't send messages in that channel.", attachments=[], view=None)
+        channel = interaction.client.get_channel(self.channel_id)
+        if channel is not None:
+            try:
+                sent = self._file()
+                call = channel.send(file=sent, **kwargs) if sent else channel.send(**kwargs)
+                await asyncio.wait_for(call, timeout=1.5)
+                await interaction.response.edit_message(content="Sent 1 message publicly", attachments=[], view=None)
+                return
+            except Exception as exc:
+                _log(f"[say] {exc}")
+        if interaction.response.is_done():
             return
         sent = self._file()
         payload = dict(kwargs)
-        payload["ephemeral"] = False
         if sent:
             payload["file"] = sent
         await interaction.response.send_message(**payload)
@@ -2459,6 +2475,7 @@ async def say_cmd(
     if not text and image is None:
         await interaction.response.send_message("Type something or add a picture.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     raw = await image.read() if image is not None else None
     target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
     view = SaySend(text or None, raw, image.filename if image else None, target)
@@ -2469,7 +2486,7 @@ async def say_cmd(
         payload["content"] = text
     if raw:
         payload["file"] = discord.File(_io.BytesIO(raw), filename=image.filename)
-    await interaction.response.send_message(**payload)
+    await interaction.followup.send(**payload)
 
 
 @tree.command(name="reply", description="Reply to a message. Nobody sees who used it.")
@@ -2528,13 +2545,14 @@ async def dm_cmd(
     id: Optional[str] = None,
     file: Optional[discord.Attachment] = None,
 ):
+    await interaction.response.defer(ephemeral=True)
     person = await _person(interaction, user, id)
     text = message.replace("\\n", "\n").strip()
     if person is None:
-        await interaction.response.send_message("Pick a person or paste their ID.", ephemeral=True)
+        await interaction.followup.send("Pick a person or paste their ID.", ephemeral=True)
         return
     if person.bot or person.id == interaction.user.id:
-        await interaction.response.send_message("Pick someone else.", ephemeral=True)
+        await interaction.followup.send("Pick someone else.", ephemeral=True)
         return
     attachment = await _file_from(file) if file is not None else None
     await _deliver_dm(interaction, str(person.id), text, attachment)
@@ -2542,52 +2560,55 @@ async def dm_cmd(
 
 @tree.command(name="dmreply", description="Reply to someone in the DM list.")
 async def dmreply_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     store = await _hub()
     outbound, inbound = _people(store)
     people = list({uid: row for uid, row in outbound + inbound}.items())
     if not people:
-        await interaction.response.send_message("No DMs yet.", ephemeral=True)
+        await interaction.followup.send("No DMs yet.", ephemeral=True)
         return
     view = discord.ui.View(timeout=300)
     view.add_item(PersonPick(people[:25], "Make a selection", "dmreply:pick"))
-    await interaction.response.send_message("Make a selection", view=view, ephemeral=True)
+    await interaction.followup.send("Make a selection", view=view, ephemeral=True)
 
 
 @tree.command(name="dmlist", description="Pick a person and see the messages. Only you can see it.")
 async def dmlist_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     store = await _hub()
     outbound, inbound = _people(store)
     people = {uid: row for uid, row in outbound + inbound}
     if not people:
-        await interaction.response.send_message("No DMs yet.", ephemeral=True)
+        await interaction.followup.send("No DMs yet.", ephemeral=True)
         return
     embed = discord.Embed(title="DM list", description="Make a selection.", color=0x5865F2)
     embed.set_footer(text=f"{len(people)} people")
-    await interaction.response.send_message("Make a selection", embed=embed, view=_dmlist_view(store), ephemeral=True)
+    await interaction.followup.send("Make a selection", embed=embed, view=_dmlist_view(store), ephemeral=True)
 
 
 @tree.command(name="inbox", description="Get a DM when someone messages the bot.")
 @app_commands.describe(enabled="Turn inbox on or off")
 async def inbox_cmd(interaction: discord.Interaction, enabled: Optional[bool] = None):
+    await interaction.response.defer(ephemeral=True)
     store = await _hub()
     mine = str(store.get("inbox")) == str(interaction.user.id)
     if enabled is None:
         embed = discord.Embed(title="Inbox", color=0x5865F2 if mine else 0x99AAB5)
         embed.description = "On. Anyone who DMs the bot is sent to you." if mine else "Off. Turn it on to get their messages."
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     if enabled:
         store["inbox"] = str(interaction.user.id)
         await _save_store()
         embed = discord.Embed(title="Inbox on", description="I'll DM you when someone messages the bot, with a Reply button.", color=0x34C759)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
     if not mine:
-        await interaction.response.send_message("Inbox isn't pointed at you.", ephemeral=True)
+        await interaction.followup.send("Inbox isn't pointed at you.", ephemeral=True)
         return
     store["inbox"] = None
     await _save_store()
-    await interaction.response.send_message(embed=discord.Embed(title="Inbox off", color=0xED4245), ephemeral=True)
+    await interaction.followup.send(embed=discord.Embed(title="Inbox off", color=0xED4245), ephemeral=True)
 
 
 @client.event
