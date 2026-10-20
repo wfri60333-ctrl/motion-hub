@@ -3154,12 +3154,59 @@ def _shot_font(name: str, size: int):
     return ImageFont.truetype(path, size)
 
 
+def _shot_clock(hour: int, minute: int, mer: str):
+    minute = max(0, min(59, int(minute or 0)))
+    hour = int(hour)
+    mer = (mer or "").upper().replace(".", "")
+    if mer in ("AM", "PM"):
+        if hour == 0:
+            hour, mer = 12, "AM"
+        elif hour > 12:
+            hour -= 12
+            mer = "PM"
+    elif hour == 0:
+        hour, mer = 12, "AM"
+    elif 1 <= hour <= 11:
+        mer = "AM"
+    elif hour == 12:
+        mer = "PM"
+    elif 13 <= hour <= 23:
+        hour -= 12
+        mer = "PM"
+    else:
+        return None
+    return f"{hour}:{minute:02d} {mer}"
+
+
 def _shot_time(raw: str) -> str:
     text = (raw or "").strip()
+    if not text:
+        return "Today at 12:00 AM"
+    prefix = ""
+    body = text
     low = text.lower()
-    if low.startswith("today") or low.startswith("yesterday") or "/" in text or "," in text:
+    if low.startswith("today at "):
+        prefix, body = "Today at ", text[9:].strip()
+    elif low.startswith("yesterday at "):
+        prefix, body = "Yesterday at ", text[13:].strip()
+    match = _re.search(r"(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp]\.?[Mm]\.?)?", body)
+    if match:
+        clock = _shot_clock(int(match.group(1)), int(match.group(2) or 0), match.group(3) or "")
+    else:
+        match = _re.search(r"\b(\d{1,2})\s*([AaPp]\.?[Mm]\.?)\b", body)
+        clock = _shot_clock(int(match.group(1)), 0, match.group(2)) if match else None
+        if clock is None and "/" not in body and not _re.search(r"\d{4}", body):
+            match = _re.search(r"\b(\d{1,2})\b", body)
+            clock = _shot_clock(int(match.group(1)), 0, "") if match else None
+    if not match or not clock:
         return text
-    return f"Today at {text}"
+    replaced = f"{body[:match.start()]}{clock}{body[match.end():]}"
+    replaced = " ".join(replaced.split())
+    if prefix:
+        return f"{prefix}{replaced}"
+    if "/" in text or _re.search(r"\d{4}", text):
+        return replaced
+    return f"Today at {replaced}"
 
 
 def _shot_wrap(text: str, font, width: int):
@@ -3204,25 +3251,29 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> byte
     from PIL import Image, ImageDraw
 
     scale = 2
-    name_font = _shot_font("NotoSans-Medium.ttf", 16 * scale)
-    body_font = _shot_font("NotoSans-Regular.ttf", 16 * scale)
-    time_font = _shot_font("NotoSans-Regular.ttf", 12 * scale)
+    name_font = _shot_font("Inter-Medium.ttf", 16 * scale)
+    body_font = _shot_font("Inter-Regular.ttf", 16 * scale)
+    time_font = _shot_font("Inter-Medium.ttf", 12 * scale)
+    badge_font = _shot_font("Inter-SemiBold.ttf", 10 * scale)
     label = getattr(user, "global_name", None) or getattr(user, "display_name", None) or str(user)
     stamp = _shot_time(when)
     body = text.replace("\\n", "\n").strip()[:2000]
-    max_w = 520 * scale
+    max_w = 560 * scale
     lines = _shot_wrap(body, body_font, max_w)
     avatar_size = 40 * scale
     pad_x = 16 * scale
     gap = 16 * scale
-    top = 8 * scale
+    top = 2 * scale
     line_h = 22 * scale
     name_w = name_font.getlength(label)
     time_w = time_font.getlength(stamp)
+    is_bot = bool(getattr(user, "bot", False))
+    badge_w = int(badge_font.getlength("APP") + 8 * scale) if is_bot else 0
+    badge_gap = 6 * scale if is_bot else 0
     text_w = max((body_font.getlength(line) for line in lines), default=0)
-    content_w = max(int(name_w + 8 * scale + time_w), int(text_w), 160 * scale)
-    width = pad_x + avatar_size + gap + content_w + pad_x
-    height = top + line_h + 2 * scale + line_h * len(lines) + 10 * scale
+    content_w = max(int(name_w + badge_gap + badge_w + 4 * scale + time_w), int(text_w), 420 * scale)
+    width = pad_x + avatar_size + gap + content_w + 48 * scale
+    height = top + line_h + line_h * len(lines) + 6 * scale
     image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
     draw = ImageDraw.Draw(image)
     try:
@@ -3231,32 +3282,56 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> byte
     except Exception:
         avatar = Image.new("RGBA", (avatar_size, avatar_size), (88, 101, 242, 255))
         letter = (label or "?")[:1].upper()
-        box = draw.textbbox((0, 0), letter, font=name_font)
+        box = ImageDraw.Draw(avatar).textbbox((0, 0), letter, font=name_font)
         ImageDraw.Draw(avatar).text(
-            ((avatar_size - (box[2] - box[0])) / 2, (avatar_size - (box[3] - box[1])) / 2 - 4),
+            ((avatar_size - (box[2] - box[0])) / 2, (avatar_size - (box[3] - box[1])) / 2 - 2 * scale),
             letter,
             font=name_font,
             fill=(255, 255, 255, 255),
         )
     mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
-    image.paste(avatar, (pad_x, top), mask)
+    ImageDraw.Draw(mask).ellipse((1, 1, avatar_size - 2, avatar_size - 2), fill=255)
+    image.paste(avatar, (pad_x, top + scale), mask)
     text_x = pad_x + avatar_size + gap
     name_color = (242, 243, 245, 255)
     color = getattr(user, "color", None)
     if color is not None and getattr(color, "value", 0):
         name_color = color.to_rgb() + (255,)
-    draw.text((text_x, top - 2), label, font=name_font, fill=name_color)
-    draw.text((text_x + name_w + 8 * scale, top + 6), stamp, font=time_font, fill=(148, 155, 164, 255))
-    y = top + line_h + 2 * scale
+    ascent, _descent = name_font.getmetrics()
+    baseline = top + ascent
+    draw.text((text_x, baseline), label, font=name_font, fill=name_color, anchor="ls")
+    cursor = text_x + name_w
+    if is_bot:
+        badge_h = 16 * scale
+        badge_y = baseline - badge_h + 2 * scale
+        bx = cursor + badge_gap
+        draw.rounded_rectangle((bx, badge_y, bx + badge_w, badge_y + badge_h), radius=3 * scale, fill=(88, 101, 242, 255))
+        draw.text((bx + badge_w / 2, badge_y + badge_h / 2), "APP", font=badge_font, fill=(255, 255, 255, 255), anchor="mm")
+        cursor = bx + badge_w
+    draw.text((cursor + 4 * scale, baseline), stamp, font=time_font, fill=(148, 155, 164, 255), anchor="ls")
+    y = top + line_h
     for line in lines:
         if line:
             x = text_x
             tokens = line.split(" ")
             for index, token in enumerate(tokens):
                 shown = token if index == len(tokens) - 1 else f"{token} "
-                draw.text((x, y), shown, font=body_font, fill=_shot_token_color(token))
-                x += body_font.getlength(shown)
+                fill = _shot_token_color(token)
+                width_px = body_font.getlength(shown)
+                if token.startswith("@") or token.startswith("<@"):
+                    pad = 3 * scale
+                    chip_w = body_font.getlength(token) + pad * 2
+                    chip_h = 18 * scale
+                    draw.rounded_rectangle((x, y + 2 * scale, x + chip_w, y + 2 * scale + chip_h), radius=3 * scale, fill=(61, 66, 112, 255))
+                    draw.text((x + pad, y), token, font=body_font, fill=fill)
+                    x += chip_w + (body_font.getlength(" ") if index < len(tokens) - 1 else 0)
+                    continue
+                draw.text((x, y), shown, font=body_font, fill=fill)
+                low = token.lower()
+                if low.startswith("http://") or low.startswith("https://") or low.startswith("www."):
+                    underline_w = body_font.getlength(token)
+                    draw.line((x, y + 18 * scale, x + underline_w, y + 18 * scale), fill=fill, width=max(1, scale // 2))
+                x += width_px
         y += line_h
     out = _io.BytesIO()
     image.convert("RGB").save(out, format="PNG", optimize=True)
@@ -3267,7 +3342,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> byte
 @app_commands.describe(
     user="The person the message looks like it is from.",
     text="What the message says. Type \\n for a new line.",
-    time="The time on the message, like 6:41 PM.",
+    time="The time, like 6:41 or 18:41. AM or PM is added if you leave it off.",
 )
 async def fakescreenshot_cmd(interaction: discord.Interaction, user: discord.User, text: str, time: str):
     body = text.replace("\\n", "\n").strip()
