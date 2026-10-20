@@ -55,10 +55,16 @@ intents.guilds = True
 intents.messages = True  # needed for on_message_delete
 intents.message_content = False  # privileged; we can live without content on snipe
 intents.members = True
-intents.presences = True
-intents.voice_states = True
+intents.presences = False
+intents.voice_states = False
 
-client = discord.Client(intents=intents, application_id=APP_ID)
+client = discord.Client(
+    intents=intents,
+    application_id=APP_ID,
+    chunk_guilds_at_startup=False,
+    member_cache_flags=discord.MemberCacheFlags.none(),
+    max_messages=100,
+)
 tree = app_commands.CommandTree(client)
 tree.allowed_installs = app_commands.AppInstallationType(guild=True, user=True)
 tree.allowed_contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
@@ -3012,7 +3018,7 @@ async def _random_ping_targets(interaction: discord.Interaction, status: str, ti
         _log(f"[ping] http members failed: {type(exc).__name__}: {exc}")
         members = []
     have_status = False
-    if status != "any":
+    if status != "any" and intents.presences:
         try:
             rich = await _load_members(guild)
             if rich:
@@ -3021,11 +3027,7 @@ async def _random_ping_targets(interaction: discord.Interaction, status: str, ti
         except Exception as exc:
             _log(f"[ping] status load failed: {type(exc).__name__}: {exc}")
     if not members:
-        try:
-            members = await asyncio.wait_for(guild.chunk(cache=True), timeout=20)
-        except Exception as exc:
-            _log(f"[ping] chunk failed: {type(exc).__name__}: {exc}")
-            members = [member for member in guild.members if member is not None]
+        members = [member for member in guild.members if member is not None]
     pool = [
         member
         for member in members
@@ -3259,26 +3261,26 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     label = getattr(user, "global_name", None) or getattr(user, "display_name", None) or str(user)
     stamp = _shot_time(when, period)
     body = text.replace("\\n", "\n").strip()[:2000]
-    max_w = 560 * scale
+    max_w = 320 * scale
     lines = _shot_wrap(body, body_font, max_w)
     avatar_size = 40 * scale
     pad_x = 16 * scale
     gap = 16 * scale
-    top = 2 * scale
+    top = 4 * scale
     line_h = 22 * scale
     name_w = name_font.getlength(label)
     time_w = time_font.getlength(stamp)
     is_bot = bool(getattr(user, "bot", False))
     badge_w = int(badge_font.getlength("APP") + 8 * scale) if is_bot else 0
-    badge_gap = 6 * scale if is_bot else 0
+    badge_gap = 4 * scale if is_bot else 0
     text_w = max((body_font.getlength(line) for line in lines), default=0)
-    content_w = max(int(name_w + badge_gap + badge_w + 4 * scale + time_w), int(text_w), 420 * scale)
-    width = pad_x + avatar_size + gap + content_w + 48 * scale
-    height = top + line_h + line_h * len(lines) + 6 * scale
+    content_w = max(int(name_w + badge_gap + badge_w + 4 * scale + time_w), int(text_w))
+    width = pad_x + avatar_size + gap + content_w + pad_x
+    height = top + line_h + line_h * max(1, len(lines)) + 8 * scale
     image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
     draw = ImageDraw.Draw(image)
     try:
-        raw = await user.display_avatar.replace(size=128).read()
+        raw = await asyncio.wait_for(user.display_avatar.replace(size=128).read(), timeout=4)
         avatar = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
     except Exception:
         avatar = Image.new("RGBA", (avatar_size, avatar_size), (88, 101, 242, 255))
@@ -3346,6 +3348,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     time="The time, like 6:43. You can also type 6:43 PM here.",
     period="AM or PM. If the time already has one, that one is used.",
 )
+@app_commands.rename(period="am-pm")
 @app_commands.choices(period=[
     app_commands.Choice(name="AM", value="AM"),
     app_commands.Choice(name="PM", value="PM"),
