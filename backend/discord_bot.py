@@ -3152,6 +3152,7 @@ async def reply_menu(interaction: discord.Interaction, message: discord.Message)
 
 _SHOT_FONTS = {}
 _SHOT_AVATARS = {}
+_SHOT_TAGS = {}
 
 
 def _shot_font(name: str, size: int):
@@ -3174,6 +3175,7 @@ def _preload_shot_fonts():
             ("Inter-Regular.ttf", 32),
             ("Inter-Medium.ttf", 24),
             ("Inter-SemiBold.ttf", 20),
+            ("Inter-SemiBold.ttf", 24),
         ):
             _shot_font(name, size)
     except Exception as exc:
@@ -3274,6 +3276,35 @@ def _shot_token_color(token: str):
     return (219, 222, 225, 255)
 
 
+async def _shot_tag(user):
+    cached = _SHOT_TAGS.get(user.id)
+    now = asyncio.get_running_loop().time()
+    if cached and now - cached[0] < 900:
+        return cached[1], cached[2]
+    tag = None
+    icon = None
+    try:
+        data = await asyncio.wait_for(user._state.http.get_user(user.id), timeout=2)
+        guild = data.get("primary_guild") or {}
+        if guild.get("identity_enabled") and guild.get("tag"):
+            tag = str(guild["tag"])[:4]
+            guild_id = guild.get("identity_guild_id")
+            badge = guild.get("badge")
+            if guild_id and badge:
+                for path in ("guild-tag-badges", "clan-badges"):
+                    url = f"https://cdn.discordapp.com/{path}/{guild_id}/{badge}.png?size=64"
+                    async with user._state.http.session.get(url) as resp:
+                        if resp.status == 200:
+                            icon = await resp.read()
+                            break
+    except Exception as exc:
+        _log(f"[screenshot] tag {exc}")
+    _SHOT_TAGS[user.id] = (now, tag, icon)
+    if len(_SHOT_TAGS) > 300:
+        _SHOT_TAGS.pop(next(iter(_SHOT_TAGS)))
+    return tag, icon
+
+
 async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period: str = "") -> bytes:
     from PIL import Image, ImageDraw
 
@@ -3282,7 +3313,12 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     body_font = _shot_font("Inter-Regular.ttf", 16 * scale)
     time_font = _shot_font("Inter-Medium.ttf", 12 * scale)
     badge_font = _shot_font("Inter-SemiBold.ttf", 10 * scale)
-    label = getattr(user, "global_name", None) or getattr(user, "display_name", None) or str(user)
+    tag_font = _shot_font("Inter-SemiBold.ttf", 12 * scale)
+    if isinstance(user, discord.Member):
+        label = user.display_name
+    else:
+        label = getattr(user, "global_name", None) or getattr(user, "name", None) or str(user)
+    tag_text, tag_raw = await _shot_tag(user)
     stamp = _shot_time(when, period)
     body = text.replace("\\n", "\n").strip()[:2000]
     max_w = 320 * scale
@@ -3297,8 +3333,12 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     is_bot = bool(getattr(user, "bot", False))
     badge_w = int(badge_font.getlength("APP") + 8 * scale) if is_bot else 0
     badge_gap = 4 * scale if is_bot else 0
+    tag_w = 0
+    if tag_text:
+        icon_slot = 16 * scale if tag_raw else 0
+        tag_w = int(4 * scale + icon_slot + tag_font.getlength(tag_text) + 5 * scale)
     text_w = max((body_font.getlength(line) for line in lines), default=0)
-    content_w = max(int(name_w + badge_gap + badge_w + 4 * scale + time_w), int(text_w))
+    content_w = max(int(name_w + (6 * scale if tag_w else 0) + tag_w + badge_gap + badge_w + 6 * scale + time_w), int(text_w))
     width = pad_x + avatar_size + gap + content_w + pad_x
     height = top + line_h + line_h * max(1, len(lines)) + 8 * scale
     image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
@@ -3336,6 +3376,27 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     baseline = top + ascent
     draw.text((text_x, baseline), label, font=name_font, fill=name_color, anchor="ls")
     cursor = text_x + name_w
+    if tag_text:
+        cursor += 6 * scale
+        chip_h = 18 * scale
+        chip_y = top + (line_h - chip_h) / 2
+        draw.rounded_rectangle(
+            (cursor, chip_y, cursor + tag_w, chip_y + chip_h),
+            radius=4 * scale,
+            fill=(63, 65, 71, 255),
+        )
+        inner = cursor + 2 * scale
+        if tag_raw:
+            icon_size = 14 * scale
+            icon = Image.open(_io.BytesIO(tag_raw)).convert("RGBA").resize((icon_size, icon_size), Image.Resampling.BILINEAR)
+            icon_mask = Image.new("L", (icon_size, icon_size), 0)
+            ImageDraw.Draw(icon_mask).rounded_rectangle((0, 0, icon_size - 1, icon_size - 1), radius=3 * scale, fill=255)
+            icon_y = int(chip_y + (chip_h - icon_size) / 2)
+            image.paste(icon, (int(inner), icon_y), icon_mask)
+            inner += icon_size + 2 * scale
+        text_y = chip_y + chip_h / 2
+        draw.text((inner, text_y), tag_text, font=tag_font, fill=(242, 243, 245, 255), anchor="lm")
+        cursor += tag_w
     if is_bot:
         badge_h = 16 * scale
         badge_y = baseline - badge_h + 2 * scale
@@ -3369,7 +3430,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
                 x += width_px
         y += line_h
     out = _io.BytesIO()
-    image.convert("RGB").save(out, format="JPEG", quality=84, optimize=False)
+    image.convert("RGB").save(out, format="PNG", compress_level=1)
     return out.getvalue()
 
 
@@ -3407,7 +3468,7 @@ async def fakescreenshot_cmd(
         await interaction.followup.send("Couldn't make that picture.", ephemeral=True)
         return
     await interaction.followup.send(
-        file=discord.File(_io.BytesIO(png), filename="message.jpg"),
+        file=discord.File(_io.BytesIO(png), filename="message.png"),
         ephemeral=True,
     )
 
