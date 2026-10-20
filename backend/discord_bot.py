@@ -3178,10 +3178,11 @@ def _shot_clock(hour: int, minute: int, mer: str):
     return f"{hour}:{minute:02d} {mer}"
 
 
-def _shot_time(raw: str) -> str:
+def _shot_time(raw: str, period: str = "") -> str:
     text = (raw or "").strip()
     if not text:
         return "Today at 12:00 AM"
+    chosen = "" if _re.search(r"[AaPp]\.?[Mm]\.?", text) else (period or "").upper()
     prefix = ""
     body = text
     low = text.lower()
@@ -3191,13 +3192,13 @@ def _shot_time(raw: str) -> str:
         prefix, body = "Yesterday at ", text[13:].strip()
     match = _re.search(r"(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp]\.?[Mm]\.?)?", body)
     if match:
-        clock = _shot_clock(int(match.group(1)), int(match.group(2) or 0), match.group(3) or "")
+        clock = _shot_clock(int(match.group(1)), int(match.group(2) or 0), match.group(3) or chosen)
     else:
         match = _re.search(r"\b(\d{1,2})\s*([AaPp]\.?[Mm]\.?)\b", body)
         clock = _shot_clock(int(match.group(1)), 0, match.group(2)) if match else None
         if clock is None and "/" not in body and not _re.search(r"\d{4}", body):
             match = _re.search(r"\b(\d{1,2})\b", body)
-            clock = _shot_clock(int(match.group(1)), 0, "") if match else None
+            clock = _shot_clock(int(match.group(1)), 0, chosen) if match else None
     if not match or not clock:
         return text
     replaced = f"{body[:match.start()]}{clock}{body[match.end():]}"
@@ -3247,7 +3248,7 @@ def _shot_token_color(token: str):
     return (219, 222, 225, 255)
 
 
-async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> bytes:
+async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period: str = "") -> bytes:
     from PIL import Image, ImageDraw
 
     scale = 2
@@ -3256,7 +3257,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> byte
     time_font = _shot_font("Inter-Medium.ttf", 12 * scale)
     badge_font = _shot_font("Inter-SemiBold.ttf", 10 * scale)
     label = getattr(user, "global_name", None) or getattr(user, "display_name", None) or str(user)
-    stamp = _shot_time(when)
+    stamp = _shot_time(when, period)
     body = text.replace("\\n", "\n").strip()[:2000]
     max_w = 560 * scale
     lines = _shot_wrap(body, body_font, max_w)
@@ -3342,19 +3343,30 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> byte
 @app_commands.describe(
     user="The person the message looks like it is from.",
     text="What the message says. Type \\n for a new line.",
-    time="The time, like 6:41 or 18:41. AM or PM is added if you leave it off.",
+    time="The time, like 6:43. You can also type 6:43 PM here.",
+    period="AM or PM. If the time already has one, that one is used.",
 )
-async def fakescreenshot_cmd(interaction: discord.Interaction, user: discord.User, text: str, time: str):
+@app_commands.choices(period=[
+    app_commands.Choice(name="AM", value="AM"),
+    app_commands.Choice(name="PM", value="PM"),
+])
+async def fakescreenshot_cmd(
+    interaction: discord.Interaction,
+    user: discord.User,
+    text: str,
+    time: str,
+    period: str,
+):
     body = text.replace("\\n", "\n").strip()
     if not body:
         await interaction.response.send_message("Type the message.", ephemeral=True)
         return
     if not (time or "").strip():
-        await interaction.response.send_message("Type a time, like 6:41 PM.", ephemeral=True)
+        await interaction.response.send_message("Type a time, like 6:43.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        png = await _fake_screenshot(user, body, time)
+        png = await _fake_screenshot(user, body, time, period)
     except Exception as exc:
         _log(f"[screenshot] {exc}")
         await interaction.followup.send("Couldn't make that picture.", ephemeral=True)
