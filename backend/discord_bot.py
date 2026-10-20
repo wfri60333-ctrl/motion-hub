@@ -2403,19 +2403,33 @@ async def _deliver_dm(interaction: discord.Interaction, user_id: str, text: str,
 
 
 class SaySend(discord.ui.View):
-    def __init__(self, text, raw, filename, channel_id):
+    def __init__(self, text, raw, filename, channel_id, times=1):
         super().__init__(timeout=180)
         self.text = text
         self.raw = raw
         self.filename = filename
         self.channel_id = int(channel_id)
+        self.times = max(1, int(times))
         self.owner_id = None
         self.token = None
+        self.running = False
+        self.stopped = False
+        if self.times <= 1:
+            self.remove_item(self.start)
+            self.remove_item(self.halt)
+        else:
+            self.remove_item(self.go)
 
     def _file(self):
         if not self.raw:
             return None
         return discord.File(_io.BytesIO(self.raw), filename=self.filename or "file")
+
+    def _kwargs(self):
+        kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
+        if self.text:
+            kwargs["content"] = self.text[:2000]
+        return kwargs
 
     async def interaction_check(self, interaction: discord.Interaction):
         if self.owner_id and interaction.user.id != self.owner_id:
@@ -2423,11 +2437,51 @@ class SaySend(discord.ui.View):
             return False
         return True
 
+    async def _mark(self, interaction: discord.Interaction, text: str):
+        try:
+            route = discord.http.Route(
+                "PATCH",
+                "/webhooks/{application_id}/{interaction_token}/messages/@original",
+                application_id=APP_ID or interaction.application_id,
+                interaction_token=self.token,
+            )
+            await interaction.client.http.request(
+                route, json={"content": text, "components": [], "embeds": [], "attachments": []}
+            )
+        except Exception as exc:
+            _log(f"[say-edit] {exc}")
+
+    async def _send_one(self, channel):
+        sent = self._file()
+        kwargs = self._kwargs()
+        try:
+            if sent:
+                await channel.send(file=sent, **kwargs)
+            else:
+                await channel.send(**kwargs)
+            return True
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) != 429 or self.stopped:
+                _log(f"[say] {exc}")
+                return False
+            await asyncio.sleep(1.6)
+            sent = self._file()
+            try:
+                if sent:
+                    await channel.send(file=sent, **kwargs)
+                else:
+                    await channel.send(**kwargs)
+                return True
+            except Exception as again:
+                _log(f"[say] {again}")
+                return False
+        except Exception as exc:
+            _log(f"[say] {exc}")
+            return False
+
     @discord.ui.button(label="Send", style=discord.ButtonStyle.primary)
     async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
-        kwargs = {"allowed_mentions": discord.AllowedMentions.none()}
-        if self.text:
-            kwargs["content"] = self.text[:2000]
+        kwargs = self._kwargs()
         channel = interaction.client.get_channel(self.channel_id)
         if channel is not None:
             try:
@@ -2445,29 +2499,86 @@ class SaySend(discord.ui.View):
         if sent:
             payload["file"] = sent
         await interaction.response.send_message(**payload)
+        await self._mark(interaction, "Sent 1 message publicly")
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.running:
+            await interaction.response.send_message("Already started.", ephemeral=True)
+            return
+        self.running = True
+        button.disabled = True
+        count = self.times
+        channel = interaction.client.get_channel(self.channel_id)
+        if channel is None:
+            kwargs = self._kwargs()
+            sent_file = self._file()
+            payload = dict(kwargs)
+            if sent_file:
+                payload["file"] = sent_file
+            await interaction.response.send_message(**payload)
+            sent = 1
+            for _ in range(count - 1):
+                if self.stopped:
+                    break
+                await asyncio.sleep(0.6)
+                if self.stopped:
+                    break
+                kwargs = self._kwargs()
+                sent_file = self._file()
+                payload = dict(kwargs)
+                if sent_file:
+                    payload["file"] = sent_file
+                await interaction.followup.send(**payload)
+                sent += 1
+            word = "message" if sent == 1 else "messages"
+            text = f"Stopped. Sent {sent} {word}." if self.stopped else f"Sent {sent} {word} publicly"
+            await self._mark(interaction, text)
+            return
+        await interaction.response.edit_message(content=f"Sending 0/{count}...", embed=None, attachments=[], view=self)
+        sent = 0
+        for index in range(count):
+            if self.stopped:
+                break
+            if not await self._send_one(channel):
+                break
+            sent += 1
+            if self.stopped:
+                break
+            try:
+                await interaction.edit_original_response(content=f"Sending {sent}/{count}...", view=self)
+            except Exception:
+                pass
+            if index + 1 < count:
+                await asyncio.sleep(0.6)
+        word = "message" if sent == 1 else "messages"
+        text = f"Stopped. Sent {sent} {word}." if self.stopped else f"Sent {sent} {word} publicly"
         try:
-            route = discord.http.Route(
-                "PATCH",
-                "/webhooks/{application_id}/{interaction_token}/messages/@original",
-                application_id=APP_ID or interaction.application_id,
-                interaction_token=self.token,
-            )
-            await interaction.client.http.request(
-                route, json={"content": "Sent 1 message publicly", "components": [], "attachments": []}
-            )
+            await interaction.edit_original_response(content=text, view=None)
         except Exception as exc:
             _log(f"[say-edit] {exc}")
 
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def halt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stopped = True
+        if not self.running:
+            await interaction.response.edit_message(content="Stopped.", embed=None, attachments=[], view=None)
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
-@tree.command(name="say", description="Post a message as the bot. Only you see it until you press Send.")
+
+@tree.command(name="say", description="Post a message as the bot. Only you see it until you send it.")
 @app_commands.describe(
     message="The text to post. Type \\n to start a new line.",
+    times="How many times to post it. Type any number from 1 to 100. Leave empty to post once.",
     image="A picture to post with the text.",
     channel_id="Channel ID to post in. Leave empty to use this channel.",
 )
 async def say_cmd(
     interaction: discord.Interaction,
     message: Optional[str] = None,
+    times: Optional[app_commands.Range[int, 1, 100]] = None,
     image: Optional[discord.Attachment] = None,
     channel_id: Optional[str] = None,
 ):
@@ -2475,10 +2586,11 @@ async def say_cmd(
     if not text and image is None:
         await interaction.response.send_message("Type something or add a picture.", ephemeral=True)
         return
+    count = int(times) if times else 1
     await interaction.response.defer(ephemeral=True)
     raw = await image.read() if image is not None else None
     target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
-    view = SaySend(text or None, raw, image.filename if image else None, target)
+    view = SaySend(text or None, raw, image.filename if image else None, target, count)
     view.owner_id = interaction.user.id
     view.token = interaction.token
     payload = {"view": view, "ephemeral": True}
@@ -2486,6 +2598,11 @@ async def say_cmd(
         payload["content"] = text
     if raw:
         payload["file"] = discord.File(_io.BytesIO(raw), filename=image.filename)
+    if count > 1:
+        payload["embed"] = discord.Embed(
+            description=f"Posts this {count} times. Only you can see this. Press Start. Stop cancels.",
+            color=0x5865F2,
+        )
     await interaction.followup.send(**payload)
 
 
