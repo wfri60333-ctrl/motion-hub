@@ -3209,7 +3209,7 @@ def _shot_clock(hour: int, minute: int, mer: str):
 def _shot_time(raw: str, period: str = "") -> str:
     text = (raw or "").strip()
     if not text:
-        return "Today at 12:00 AM"
+        return "12:00 AM"
     chosen = "" if _re.search(r"[AaPp]\.?[Mm]\.?", text) else (period or "").upper()
     prefix = ""
     body = text
@@ -3235,7 +3235,7 @@ def _shot_time(raw: str, period: str = "") -> str:
         return f"{prefix}{replaced}"
     if "/" in text or _re.search(r"\d{4}", text):
         return replaced
-    return f"Today at {replaced}"
+    return replaced
 
 
 def _shot_wrap(text: str, font, width: int):
