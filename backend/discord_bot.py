@@ -276,6 +276,7 @@ async def on_ready():
     except Exception as e:
         _log(f"[fakeip-view] failed: {e}")
     await _push_runtime()
+    _preload_shot_fonts()
     try:
         await _hub()
     except Exception as exc:
@@ -3149,11 +3150,34 @@ async def reply_menu(interaction: discord.Interaction, message: discord.Message)
     await interaction.response.send_modal(ReplyModal(message))
 
 
+_SHOT_FONTS = {}
+_SHOT_AVATARS = {}
+
+
 def _shot_font(name: str, size: int):
     from PIL import ImageFont
 
+    key = (name, size)
+    font = _SHOT_FONTS.get(key)
+    if font is not None:
+        return font
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", name)
-    return ImageFont.truetype(path, size)
+    font = ImageFont.truetype(path, size)
+    _SHOT_FONTS[key] = font
+    return font
+
+
+def _preload_shot_fonts():
+    try:
+        for name, size in (
+            ("Inter-Medium.ttf", 32),
+            ("Inter-Regular.ttf", 32),
+            ("Inter-Medium.ttf", 24),
+            ("Inter-SemiBold.ttf", 20),
+        ):
+            _shot_font(name, size)
+    except Exception as exc:
+        _log(f"[screenshot] font preload failed: {exc}")
 
 
 def _shot_clock(hour: int, minute: int, mer: str):
@@ -3280,8 +3304,16 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
     draw = ImageDraw.Draw(image)
     try:
-        raw = await asyncio.wait_for(user.display_avatar.replace(size=128).read(), timeout=4)
-        avatar = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        cached = _SHOT_AVATARS.get(user.id)
+        now = asyncio.get_running_loop().time()
+        if cached and now - cached[0] < 900:
+            raw = cached[1]
+        else:
+            raw = await asyncio.wait_for(user.display_avatar.replace(size=64).read(), timeout=1.5)
+            _SHOT_AVATARS[user.id] = (now, raw)
+            if len(_SHOT_AVATARS) > 300:
+                _SHOT_AVATARS.pop(next(iter(_SHOT_AVATARS)))
+        avatar = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.BILINEAR)
     except Exception:
         avatar = Image.new("RGBA", (avatar_size, avatar_size), (88, 101, 242, 255))
         letter = (label or "?")[:1].upper()
@@ -3337,7 +3369,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
                 x += width_px
         y += line_h
     out = _io.BytesIO()
-    image.convert("RGB").save(out, format="PNG", optimize=True)
+    image.convert("RGB").save(out, format="JPEG", quality=84, optimize=False)
     return out.getvalue()
 
 
@@ -3375,7 +3407,7 @@ async def fakescreenshot_cmd(
         await interaction.followup.send("Couldn't make that picture.", ephemeral=True)
         return
     await interaction.followup.send(
-        file=discord.File(_io.BytesIO(png), filename="message.png"),
+        file=discord.File(_io.BytesIO(png), filename="message.jpg"),
         ephemeral=True,
     )
 
