@@ -3153,6 +3153,7 @@ async def reply_menu(interaction: discord.Interaction, message: discord.Message)
 _SHOT_FONTS = {}
 _SHOT_AVATARS = {}
 _SHOT_TAGS = {}
+_NOTDEF = {}
 
 
 def _shot_font(name: str, size: int):
@@ -3166,6 +3167,53 @@ def _shot_font(name: str, size: int):
     font = ImageFont.truetype(path, size)
     _SHOT_FONTS[key] = font
     return font
+
+
+def _glyph_sig(font, char: str):
+    mask = font.getmask(char)
+    width, height = mask.size
+    if width <= 0 or height <= 0:
+        return (0, 0, ())
+    points = []
+    for y in range(0, height, max(1, height // 5)):
+        for x in range(0, width, max(1, width // 3)):
+            points.append(mask.getpixel((x, y)))
+    return (width, height, tuple(points))
+
+
+def _glyph_missing(font, char: str) -> bool:
+    if not char or char.isspace():
+        return False
+    missing = _NOTDEF.get(id(font))
+    if missing is None:
+        missing = _glyph_sig(font, "\u0378")
+        _NOTDEF[id(font)] = missing
+    return _glyph_sig(font, char) == missing
+
+
+def _font_for(font, char: str):
+    if not _glyph_missing(font, char):
+        return font
+    for name in ("NotoSansMath-Regular.ttf", "unifont_upper.otf"):
+        try:
+            fallback = _shot_font(name, font.size)
+        except Exception:
+            continue
+        if not _glyph_missing(fallback, char):
+            return fallback
+    return font
+
+
+def _mix_width(font, text: str) -> float:
+    return sum(_font_for(font, char).getlength(char) for char in text)
+
+
+def _draw_mix(draw, x, y, text: str, font, fill, anchor="ls"):
+    for char in text:
+        use = _font_for(font, char)
+        draw.text((x, y), char, font=use, fill=fill, anchor=anchor)
+        x += use.getlength(char)
+    return x
 
 
 def _preload_shot_fonts():
@@ -3321,7 +3369,7 @@ async def _shot_tag(user):
     try:
         data = await asyncio.wait_for(user._state.http.get_user(user.id), timeout=2)
         guild = data.get("primary_guild") or {}
-        if guild.get("identity_enabled") and guild.get("tag"):
+        if guild.get("identity_enabled") is True and str(guild.get("tag") or "").strip():
             tag = str(guild["tag"])[:4]
             guild_id = guild.get("identity_guild_id")
             badge = guild.get("badge")
@@ -3421,7 +3469,7 @@ def _shot_styled_lines(text: str, scale: int, max_w: int):
             pad = 6 * scale if kind in ("code", "spoiler", "mention") else 0
             bits = _re.findall(r"\s+|\S+", piece)
             for bit in bits:
-                bit_w = font.getlength(bit) + (pad if bit.strip() else 0)
+                bit_w = _mix_width(font, bit) + (pad if bit.strip() else 0)
                 if width + bit_w > max_w and line and not bit.isspace():
                     lines.append(line)
                     line = []
@@ -3458,7 +3506,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     gap = 16 * scale
     top = 4 * scale
     line_h = 22 * scale
-    name_w = name_font.getlength(label)
+    name_w = _mix_width(name_font, label)
     time_w = time_font.getlength(stamp)
     is_bot = bool(getattr(user, "bot", False))
     badge_w = int(badge_font.getlength("APP") + 8 * scale) if is_bot else 0
@@ -3467,12 +3515,12 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     tag_icon_size = 12 * scale
     if tag_text:
         icon_slot = tag_icon_size + 3 * scale if tag_raw else 0
-        tag_w = int(3 * scale + icon_slot + tag_font.getlength(tag_text) + 4 * scale)
+        tag_w = int(3 * scale + icon_slot + _mix_width(tag_font, tag_text) + 4 * scale)
     text_w = 0
     for styled_line in styled:
         used = 0
         for bit, kind in styled_line:
-            used += _shot_style_font(kind, scale).getlength(bit)
+            used += _mix_width(_shot_style_font(kind, scale), bit)
             if kind in ("code", "spoiler", "mention") and bit.strip():
                 used += 6 * scale
         text_w = max(text_w, used)
@@ -3512,8 +3560,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
         name_color = color.to_rgb() + (255,)
     ascent, _descent = name_font.getmetrics()
     baseline = top + ascent
-    draw.text((text_x, baseline), label, font=name_font, fill=name_color, anchor="ls")
-    cursor = text_x + name_w
+    cursor = _draw_mix(draw, text_x, baseline, label, name_font, name_color)
     if tag_text:
         cursor += 4 * scale
         chip_h = 16 * scale
@@ -3536,7 +3583,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
             icon_y = int(chip_y + (chip_h - tag_icon_size) / 2)
             image.paste(icon, (int(inner), icon_y), icon)
             inner += tag_icon_size + 3 * scale
-        draw.text((inner, chip_y + chip_h / 2), tag_text, font=tag_font, fill=(255, 255, 255, 255), anchor="lm")
+        _draw_mix(draw, inner, chip_y + chip_h / 2, tag_text, tag_font, (255, 255, 255, 255), anchor="lm")
         cursor += tag_w
     if is_bot:
         badge_h = 16 * scale
@@ -3562,18 +3609,18 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
                 fill = (32, 34, 37, 255)
             if kind in ("code", "spoiler", "mention") and bit.strip():
                 pad = 3 * scale
-                chip_w = font.getlength(bit) + pad * 2
+                chip_w = _mix_width(font, bit) + pad * 2
                 chip_h = 18 * scale
                 chip_bg = (32, 34, 37, 255) if kind == "spoiler" else (61, 66, 112, 255) if kind == "mention" else (43, 45, 49, 255)
                 draw.rounded_rectangle((x, y + 2 * scale, x + chip_w, y + 2 * scale + chip_h), radius=3 * scale, fill=chip_bg)
-                draw.text((x + pad, y + (2 * scale if kind == "code" else 0)), bit, font=font, fill=fill)
+                _draw_mix(draw, x + pad, y + (2 * scale if kind == "code" else 0), bit, font, fill, anchor="lt")
                 if kind == "strike":
                     mid = y + 12 * scale
                     draw.line((x + pad, mid, x + chip_w - pad, mid), fill=fill, width=max(1, scale // 2))
                 x += chip_w
                 continue
-            draw.text((x, y), bit, font=font, fill=fill)
-            bit_w = font.getlength(bit)
+            _draw_mix(draw, x, y, bit, font, fill, anchor="lt")
+            bit_w = _mix_width(font, bit)
             if kind == "link" and bit.strip():
                 draw.line((x, y + 18 * scale, x + bit_w, y + 18 * scale), fill=fill, width=max(1, scale // 2))
             if kind == "strike":
