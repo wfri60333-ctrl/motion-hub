@@ -295,7 +295,7 @@ async def _sync_commands():
         return
     _SYNCED = True
     try:
-        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox", "chaos", "ping"}
+        keep = {"say", "reply", "fakeip", "dm", "dmreply", "dmlist", "inbox", "chaos", "ping", "fakescreenshot"}
         for cmd in list(tree.get_commands()):
             if cmd.name.lower() not in keep:
                 tree.remove_command(cmd.name, type=getattr(cmd, "type", discord.AppCommandType.chat_input))
@@ -3145,6 +3145,149 @@ class ReplyModal(discord.ui.Modal, title="Reply"):
 @tree.context_menu(name="Reply")
 async def reply_menu(interaction: discord.Interaction, message: discord.Message):
     await interaction.response.send_modal(ReplyModal(message))
+
+
+def _shot_font(name: str, size: int):
+    from PIL import ImageFont
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", name)
+    return ImageFont.truetype(path, size)
+
+
+def _shot_time(raw: str) -> str:
+    text = (raw or "").strip()
+    low = text.lower()
+    if low.startswith("today") or low.startswith("yesterday") or "/" in text or "," in text:
+        return text
+    return f"Today at {text}"
+
+
+def _shot_wrap(text: str, font, width: int):
+    lines = []
+    for para in text.split("\n"):
+        if para == "":
+            lines.append("")
+            continue
+        current = ""
+        for word in para.split(" "):
+            trial = word if not current else f"{current} {word}"
+            if font.getlength(trial) <= width:
+                current = trial
+                continue
+            if current:
+                lines.append(current)
+            if font.getlength(word) <= width:
+                current = word
+                continue
+            chunk = ""
+            for char in word:
+                if font.getlength(chunk + char) <= width:
+                    chunk += char
+                else:
+                    lines.append(chunk)
+                    chunk = char
+            current = chunk
+        lines.append(current)
+    return lines or [""]
+
+
+def _shot_token_color(token: str):
+    low = token.lower()
+    if low.startswith("http://") or low.startswith("https://") or low.startswith("www."):
+        return (0, 168, 252, 255)
+    if token.startswith("@") or token.startswith("<@"):
+        return (201, 205, 251, 255)
+    return (219, 222, 225, 255)
+
+
+async def _fake_screenshot(user: discord.abc.User, text: str, when: str) -> bytes:
+    from PIL import Image, ImageDraw
+
+    scale = 2
+    name_font = _shot_font("NotoSans-Medium.ttf", 16 * scale)
+    body_font = _shot_font("NotoSans-Regular.ttf", 16 * scale)
+    time_font = _shot_font("NotoSans-Regular.ttf", 12 * scale)
+    label = getattr(user, "global_name", None) or getattr(user, "display_name", None) or str(user)
+    stamp = _shot_time(when)
+    body = text.replace("\\n", "\n").strip()[:2000]
+    max_w = 520 * scale
+    lines = _shot_wrap(body, body_font, max_w)
+    avatar_size = 40 * scale
+    pad_x = 16 * scale
+    gap = 16 * scale
+    top = 8 * scale
+    line_h = 22 * scale
+    name_w = name_font.getlength(label)
+    time_w = time_font.getlength(stamp)
+    text_w = max((body_font.getlength(line) for line in lines), default=0)
+    content_w = max(int(name_w + 8 * scale + time_w), int(text_w), 160 * scale)
+    width = pad_x + avatar_size + gap + content_w + pad_x
+    height = top + line_h + 2 * scale + line_h * len(lines) + 10 * scale
+    image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
+    draw = ImageDraw.Draw(image)
+    try:
+        raw = await user.display_avatar.replace(size=128).read()
+        avatar = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+    except Exception:
+        avatar = Image.new("RGBA", (avatar_size, avatar_size), (88, 101, 242, 255))
+        letter = (label or "?")[:1].upper()
+        box = draw.textbbox((0, 0), letter, font=name_font)
+        ImageDraw.Draw(avatar).text(
+            ((avatar_size - (box[2] - box[0])) / 2, (avatar_size - (box[3] - box[1])) / 2 - 4),
+            letter,
+            font=name_font,
+            fill=(255, 255, 255, 255),
+        )
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size - 1, avatar_size - 1), fill=255)
+    image.paste(avatar, (pad_x, top), mask)
+    text_x = pad_x + avatar_size + gap
+    name_color = (242, 243, 245, 255)
+    color = getattr(user, "color", None)
+    if color is not None and getattr(color, "value", 0):
+        name_color = color.to_rgb() + (255,)
+    draw.text((text_x, top - 2), label, font=name_font, fill=name_color)
+    draw.text((text_x + name_w + 8 * scale, top + 6), stamp, font=time_font, fill=(148, 155, 164, 255))
+    y = top + line_h + 2 * scale
+    for line in lines:
+        if line:
+            x = text_x
+            tokens = line.split(" ")
+            for index, token in enumerate(tokens):
+                shown = token if index == len(tokens) - 1 else f"{token} "
+                draw.text((x, y), shown, font=body_font, fill=_shot_token_color(token))
+                x += body_font.getlength(shown)
+        y += line_h
+    out = _io.BytesIO()
+    image.convert("RGB").save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+@tree.command(name="fakescreenshot", description="Make a picture of a Discord message. Only you can see it.")
+@app_commands.describe(
+    user="The person the message looks like it is from.",
+    text="What the message says. Type \\n for a new line.",
+    time="The time on the message, like 6:41 PM.",
+)
+async def fakescreenshot_cmd(interaction: discord.Interaction, user: discord.User, text: str, time: str):
+    body = text.replace("\\n", "\n").strip()
+    if not body:
+        await interaction.response.send_message("Type the message.", ephemeral=True)
+        return
+    if not (time or "").strip():
+        await interaction.response.send_message("Type a time, like 6:41 PM.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        png = await _fake_screenshot(user, body, time)
+    except Exception as exc:
+        _log(f"[screenshot] {exc}")
+        await interaction.followup.send("Couldn't make that picture.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        file=discord.File(_io.BytesIO(png), filename="message.png"),
+        ephemeral=True,
+    )
 
 
 @tree.command(name="fakeip", description="Show a fake network lookup. Only you see the person picker.")
