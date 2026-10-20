@@ -2571,22 +2571,22 @@ class SaySend(discord.ui.View):
 @tree.command(name="say", description="Post a message as the bot. Only you see it until you send it.")
 @app_commands.describe(
     message="The text to post. Type \\n to start a new line.",
-    times="How many times to post it. Type any number from 1 to 100. Leave empty to post once.",
+    amount="How many times to post it. Type any number from 1 to 100. Leave empty to post once.",
     image="A picture to post with the text.",
     channel_id="Channel ID to post in. Leave empty to use this channel.",
 )
 async def say_cmd(
     interaction: discord.Interaction,
-    message: Optional[str] = None,
-    times: Optional[app_commands.Range[int, 1, 100]] = None,
+    message: str,
+    amount: Optional[app_commands.Range[int, 1, 100]] = None,
     image: Optional[discord.Attachment] = None,
     channel_id: Optional[str] = None,
 ):
-    text = (message or "").replace("\\n", "\n").strip()
-    if not text and image is None:
-        await interaction.response.send_message("Type something or add a picture.", ephemeral=True)
+    text = message.replace("\\n", "\n").strip()
+    if not text:
+        await interaction.response.send_message("Type a message.", ephemeral=True)
         return
-    count = int(times) if times else 1
+    count = int(amount) if amount else 1
     await interaction.response.defer(ephemeral=True)
     raw = await image.read() if image is not None else None
     target = _re.sub(r"\D", "", channel_id or "") or _opt(interaction, "channel") or interaction.channel_id
