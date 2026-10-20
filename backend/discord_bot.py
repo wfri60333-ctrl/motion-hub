@@ -3464,9 +3464,10 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     badge_w = int(badge_font.getlength("APP") + 8 * scale) if is_bot else 0
     badge_gap = 4 * scale if is_bot else 0
     tag_w = 0
+    tag_icon_size = 12 * scale
     if tag_text:
-        icon_slot = 16 * scale if tag_raw else 0
-        tag_w = int(4 * scale + icon_slot + tag_font.getlength(tag_text) + 5 * scale)
+        icon_slot = tag_icon_size + 3 * scale if tag_raw else 0
+        tag_w = int(3 * scale + icon_slot + tag_font.getlength(tag_text) + 4 * scale)
     text_w = 0
     for styled_line in styled:
         used = 0
@@ -3514,27 +3515,28 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     draw.text((text_x, baseline), label, font=name_font, fill=name_color, anchor="ls")
     cursor = text_x + name_w
     if tag_text:
-        cursor += 6 * scale
-        chip_h = 18 * scale
-        chip_y = top + (line_h - chip_h) / 2
-        chip_fill = _mix_tag(tag_color) if tag_color else (63, 65, 71, 255)
-        chip_text = tag_color + (255,) if tag_color else (242, 243, 245, 255)
+        cursor += 4 * scale
+        chip_h = 16 * scale
+        ink = name_font.getbbox(label or "A")
+        ink_top = baseline + ink[1]
+        ink_h = max(1, ink[3] - ink[1])
+        chip_y = ink_top + (ink_h - chip_h) / 2
         draw.rounded_rectangle(
             (cursor, chip_y, cursor + tag_w, chip_y + chip_h),
             radius=4 * scale,
-            fill=chip_fill,
+            fill=(78, 80, 88, 255),
         )
-        inner = cursor + 2 * scale
+        inner = cursor + 3 * scale
         if tag_raw:
-            icon_size = 14 * scale
-            icon = Image.open(_io.BytesIO(tag_raw)).convert("RGBA").resize((icon_size, icon_size), Image.Resampling.BILINEAR)
-            icon_mask = Image.new("L", (icon_size, icon_size), 0)
-            ImageDraw.Draw(icon_mask).rounded_rectangle((0, 0, icon_size - 1, icon_size - 1), radius=3 * scale, fill=255)
-            icon_y = int(chip_y + (chip_h - icon_size) / 2)
-            image.paste(icon, (int(inner), icon_y), icon_mask)
-            inner += icon_size + 2 * scale
-        text_y = chip_y + chip_h / 2
-        draw.text((inner, text_y), tag_text, font=tag_font, fill=chip_text, anchor="lm")
+            icon = Image.open(_io.BytesIO(tag_raw)).convert("RGBA")
+            bounds = icon.getchannel("A").getbbox()
+            if bounds:
+                icon = icon.crop(bounds)
+            icon = icon.resize((tag_icon_size, tag_icon_size), Image.Resampling.LANCZOS)
+            icon_y = int(chip_y + (chip_h - tag_icon_size) / 2)
+            image.paste(icon, (int(inner), icon_y), icon)
+            inner += tag_icon_size + 3 * scale
+        draw.text((inner, chip_y + chip_h / 2), tag_text, font=tag_font, fill=(255, 255, 255, 255), anchor="lm")
         cursor += tag_w
     if is_bot:
         badge_h = 16 * scale
