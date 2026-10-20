@@ -3175,6 +3175,7 @@ def _preload_shot_fonts():
             ("Inter-Regular.ttf", 32),
             ("Inter-Medium.ttf", 24),
             ("Inter-SemiBold.ttf", 20),
+            ("Inter-Italic.ttf", 32),
             ("Inter-SemiBold.ttf", 24),
         ):
             _shot_font(name, size)
@@ -3276,13 +3277,47 @@ def _shot_token_color(token: str):
     return (219, 222, 225, 255)
 
 
+def _mix_tag(color):
+    bg = (49, 51, 56)
+    amount = 0.24
+    return tuple(int(color[i] * amount + bg[i] * (1 - amount)) for i in range(3)) + (255,)
+
+
+def _hex_color(value):
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().lstrip("#")
+    if len(raw) != 6:
+        return None
+    try:
+        return tuple(int(raw[i : i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _sample_color(raw):
+    from PIL import Image
+
+    image = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((12, 12))
+    pixels = [pixel[:3] for pixel in image.getdata() if pixel[3] > 80]
+    if not pixels:
+        return None
+    red = sum(pixel[0] for pixel in pixels) // len(pixels)
+    green = sum(pixel[1] for pixel in pixels) // len(pixels)
+    blue = sum(pixel[2] for pixel in pixels) // len(pixels)
+    if red + green + blue < 90:
+        return None
+    return (red, green, blue)
+
+
 async def _shot_tag(user):
     cached = _SHOT_TAGS.get(user.id)
     now = asyncio.get_running_loop().time()
     if cached and now - cached[0] < 900:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
     tag = None
     icon = None
+    color = None
     try:
         data = await asyncio.wait_for(user._state.http.get_user(user.id), timeout=2)
         guild = data.get("primary_guild") or {}
@@ -3297,12 +3332,107 @@ async def _shot_tag(user):
                         if resp.status == 200:
                             icon = await resp.read()
                             break
+            if guild_id:
+                try:
+                    route = discord.http.Route("GET", "/guilds/{guild_id}/profile", guild_id=int(guild_id))
+                    profile = await user._state.http.request(route)
+                    color = _hex_color(profile.get("badge_color_primary") or profile.get("tag_color"))
+                    if color is None:
+                        for value in profile.values():
+                            if isinstance(value, dict):
+                                color = _hex_color(value.get("badge_color_primary") or value.get("tag_color"))
+                                if color:
+                                    break
+                except Exception as exc:
+                    _log(f"[screenshot] tag color {type(exc).__name__}")
+            if color is None and icon:
+                color = _sample_color(icon)
     except Exception as exc:
         _log(f"[screenshot] tag {exc}")
-    _SHOT_TAGS[user.id] = (now, tag, icon)
+    _SHOT_TAGS[user.id] = (now, tag, icon, color)
     if len(_SHOT_TAGS) > 300:
         _SHOT_TAGS.pop(next(iter(_SHOT_TAGS)))
-    return tag, icon
+    return tag, icon, color
+
+
+_SHOT_MARK = _re.compile(
+    r"\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|__(.+?)__|(?<!\*)\*(?!\*)(.+?)\*(?!\*)|(?<!_)_(?!_)(.+?)_(?!_)|~~(.+?)~~|`([^`\n]+)`|\|\|(.+?)\|\||https?://\S+|www\.\S+|<@!?\d+>|@\S+"
+)
+
+
+def _shot_runs(text: str):
+    runs = []
+    cursor = 0
+    for match in _SHOT_MARK.finditer(text):
+        if match.start() > cursor:
+            runs.append((text[cursor : match.start()], ""))
+        kind = ""
+        body = match.group(0)
+        groups = (
+            (1, "bolditalic"),
+            (2, "bold"),
+            (3, "bold"),
+            (4, "italic"),
+            (5, "italic"),
+            (6, "strike"),
+            (7, "code"),
+            (8, "spoiler"),
+        )
+        for index, name in groups:
+            if match.group(index) is not None:
+                kind = name
+                body = match.group(index)
+                break
+        if not kind:
+            low = body.lower()
+            kind = "link" if low.startswith("http") or low.startswith("www.") else "mention"
+        runs.append((body, kind))
+        cursor = match.end()
+    if cursor < len(text):
+        runs.append((text[cursor:], ""))
+    return runs or [("", "")]
+
+
+def _shot_style_font(kind: str, scale: int):
+    if kind in ("bold", "bolditalic"):
+        return _shot_font("Inter-SemiBold.ttf", 16 * scale)
+    if kind == "italic":
+        return _shot_font("Inter-Italic.ttf", 16 * scale)
+    if kind == "code":
+        return _shot_font("Inter-Regular.ttf", 14 * scale)
+    return _shot_font("Inter-Regular.ttf", 16 * scale)
+
+
+def _shot_styled_lines(text: str, scale: int, max_w: int):
+    lines = []
+    line = []
+    width = 0
+    for raw, kind in _shot_runs(text):
+        pieces = _re.split(r"(\n)", raw)
+        for piece in pieces:
+            if piece == "":
+                continue
+            if piece == "\n":
+                lines.append(line)
+                line = []
+                width = 0
+                continue
+            font = _shot_style_font(kind, scale)
+            pad = 6 * scale if kind in ("code", "spoiler", "mention") else 0
+            bits = _re.findall(r"\s+|\S+", piece)
+            for bit in bits:
+                bit_w = font.getlength(bit) + (pad if bit.strip() else 0)
+                if width + bit_w > max_w and line and not bit.isspace():
+                    lines.append(line)
+                    line = []
+                    width = 0
+                if bit.isspace() and not line:
+                    continue
+                line.append((bit, kind))
+                width += bit_w
+    if line or not lines:
+        lines.append(line)
+    return lines
 
 
 async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period: str = "") -> bytes:
@@ -3318,11 +3448,11 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
         label = user.display_name
     else:
         label = getattr(user, "global_name", None) or getattr(user, "name", None) or str(user)
-    tag_text, tag_raw = await _shot_tag(user)
+    tag_text, tag_raw, tag_color = await _shot_tag(user)
     stamp = _shot_time(when, period)
     body = text.replace("\\n", "\n").strip()[:2000]
     max_w = 320 * scale
-    lines = _shot_wrap(body, body_font, max_w)
+    styled = _shot_styled_lines(body, scale, max_w)
     avatar_size = 40 * scale
     pad_x = 16 * scale
     gap = 16 * scale
@@ -3337,10 +3467,17 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     if tag_text:
         icon_slot = 16 * scale if tag_raw else 0
         tag_w = int(4 * scale + icon_slot + tag_font.getlength(tag_text) + 5 * scale)
-    text_w = max((body_font.getlength(line) for line in lines), default=0)
+    text_w = 0
+    for styled_line in styled:
+        used = 0
+        for bit, kind in styled_line:
+            used += _shot_style_font(kind, scale).getlength(bit)
+            if kind in ("code", "spoiler", "mention") and bit.strip():
+                used += 6 * scale
+        text_w = max(text_w, used)
     content_w = max(int(name_w + (6 * scale if tag_w else 0) + tag_w + badge_gap + badge_w + 6 * scale + time_w), int(text_w))
     width = pad_x + avatar_size + gap + content_w + pad_x
-    height = top + line_h + line_h * max(1, len(lines)) + 8 * scale
+    height = top + line_h + line_h * max(1, len(styled)) + 8 * scale
     image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
     draw = ImageDraw.Draw(image)
     try:
@@ -3349,11 +3486,11 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
         if cached and now - cached[0] < 900:
             raw = cached[1]
         else:
-            raw = await asyncio.wait_for(user.display_avatar.replace(size=64).read(), timeout=1.5)
+            raw = await asyncio.wait_for(user.display_avatar.replace(size=128).read(), timeout=2)
             _SHOT_AVATARS[user.id] = (now, raw)
             if len(_SHOT_AVATARS) > 300:
                 _SHOT_AVATARS.pop(next(iter(_SHOT_AVATARS)))
-        avatar = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.BILINEAR)
+        avatar = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
     except Exception:
         avatar = Image.new("RGBA", (avatar_size, avatar_size), (88, 101, 242, 255))
         letter = (label or "?")[:1].upper()
@@ -3380,10 +3517,12 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
         cursor += 6 * scale
         chip_h = 18 * scale
         chip_y = top + (line_h - chip_h) / 2
+        chip_fill = _mix_tag(tag_color) if tag_color else (63, 65, 71, 255)
+        chip_text = tag_color + (255,) if tag_color else (242, 243, 245, 255)
         draw.rounded_rectangle(
             (cursor, chip_y, cursor + tag_w, chip_y + chip_h),
             radius=4 * scale,
-            fill=(63, 65, 71, 255),
+            fill=chip_fill,
         )
         inner = cursor + 2 * scale
         if tag_raw:
@@ -3395,7 +3534,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
             image.paste(icon, (int(inner), icon_y), icon_mask)
             inner += icon_size + 2 * scale
         text_y = chip_y + chip_h / 2
-        draw.text((inner, text_y), tag_text, font=tag_font, fill=(242, 243, 245, 255), anchor="lm")
+        draw.text((inner, text_y), tag_text, font=tag_font, fill=chip_text, anchor="lm")
         cursor += tag_w
     if is_bot:
         badge_h = 16 * scale
@@ -3406,28 +3545,39 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
         cursor = bx + badge_w
     draw.text((cursor + 4 * scale, baseline), stamp, font=time_font, fill=(148, 155, 164, 255), anchor="ls")
     y = top + line_h
-    for line in lines:
-        if line:
-            x = text_x
-            tokens = line.split(" ")
-            for index, token in enumerate(tokens):
-                shown = token if index == len(tokens) - 1 else f"{token} "
-                fill = _shot_token_color(token)
-                width_px = body_font.getlength(shown)
-                if token.startswith("@") or token.startswith("<@"):
-                    pad = 3 * scale
-                    chip_w = body_font.getlength(token) + pad * 2
-                    chip_h = 18 * scale
-                    draw.rounded_rectangle((x, y + 2 * scale, x + chip_w, y + 2 * scale + chip_h), radius=3 * scale, fill=(61, 66, 112, 255))
-                    draw.text((x + pad, y), token, font=body_font, fill=fill)
-                    x += chip_w + (body_font.getlength(" ") if index < len(tokens) - 1 else 0)
-                    continue
-                draw.text((x, y), shown, font=body_font, fill=fill)
-                low = token.lower()
-                if low.startswith("http://") or low.startswith("https://") or low.startswith("www."):
-                    underline_w = body_font.getlength(token)
-                    draw.line((x, y + 18 * scale, x + underline_w, y + 18 * scale), fill=fill, width=max(1, scale // 2))
-                x += width_px
+    normal = (219, 222, 225, 255)
+    link_c = (0, 168, 252, 255)
+    mention_c = (201, 205, 251, 255)
+    for styled_line in styled:
+        x = text_x
+        if not styled_line:
+            y += line_h
+            continue
+        for bit, kind in styled_line:
+            font = _shot_style_font(kind, scale)
+            fill = link_c if kind == "link" else mention_c if kind == "mention" else normal
+            if kind == "spoiler":
+                fill = (32, 34, 37, 255)
+            if kind in ("code", "spoiler", "mention") and bit.strip():
+                pad = 3 * scale
+                chip_w = font.getlength(bit) + pad * 2
+                chip_h = 18 * scale
+                chip_bg = (32, 34, 37, 255) if kind == "spoiler" else (61, 66, 112, 255) if kind == "mention" else (43, 45, 49, 255)
+                draw.rounded_rectangle((x, y + 2 * scale, x + chip_w, y + 2 * scale + chip_h), radius=3 * scale, fill=chip_bg)
+                draw.text((x + pad, y + (2 * scale if kind == "code" else 0)), bit, font=font, fill=fill)
+                if kind == "strike":
+                    mid = y + 12 * scale
+                    draw.line((x + pad, mid, x + chip_w - pad, mid), fill=fill, width=max(1, scale // 2))
+                x += chip_w
+                continue
+            draw.text((x, y), bit, font=font, fill=fill)
+            bit_w = font.getlength(bit)
+            if kind == "link" and bit.strip():
+                draw.line((x, y + 18 * scale, x + bit_w, y + 18 * scale), fill=fill, width=max(1, scale // 2))
+            if kind == "strike":
+                mid = y + 11 * scale
+                draw.line((x, mid, x + bit_w, mid), fill=fill, width=max(1, scale // 2))
+            x += bit_w
         y += line_h
     out = _io.BytesIO()
     image.convert("RGB").save(out, format="PNG", compress_level=1)
