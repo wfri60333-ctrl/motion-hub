@@ -3200,6 +3200,12 @@ def _font_for(font, char: str):
         except Exception:
             continue
         if not _glyph_missing(fallback, char):
+            cap = font.getbbox("H")
+            cap_h = max(1, cap[3] - cap[1])
+            ink = fallback.getbbox(char)
+            ink_h = max(1, ink[3] - ink[1])
+            if ink_h > cap_h:
+                fallback = _shot_font(name, max(8, int(font.size * cap_h / ink_h)))
             return fallback
     return font
 
@@ -3486,7 +3492,7 @@ def _shot_styled_lines(text: str, scale: int, max_w: int):
 async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period: str = "") -> bytes:
     from PIL import Image, ImageDraw
 
-    scale = 2
+    scale = 3
     name_font = _shot_font("Inter-Medium.ttf", 16 * scale)
     body_font = _shot_font("Inter-Regular.ttf", 16 * scale)
     time_font = _shot_font("Inter-Medium.ttf", 12 * scale)
@@ -3499,7 +3505,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     tag_text, tag_raw, tag_color = await _shot_tag(user)
     stamp = _shot_time(when, period)
     body = text.replace("\\n", "\n").strip()[:2000]
-    max_w = 320 * scale
+    max_w = 272 * scale
     styled = _shot_styled_lines(body, scale, max_w)
     avatar_size = 40 * scale
     pad_x = 16 * scale
@@ -3524,10 +3530,9 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
             if kind in ("code", "spoiler", "mention") and bit.strip():
                 used += 6 * scale
         text_w = max(text_w, used)
-    content_w = max(int(name_w + (6 * scale if tag_w else 0) + tag_w + badge_gap + badge_w + 6 * scale + time_w), int(text_w))
-    width = pad_x + avatar_size + gap + content_w + pad_x
+    width = 360 * scale
     height = top + line_h + line_h * max(1, len(styled)) + 8 * scale
-    image = Image.new("RGBA", (width, height), (49, 51, 56, 255))
+    image = Image.new("RGBA", (width, height), (41, 44, 51, 255))
     draw = ImageDraw.Draw(image)
     try:
         cached = _SHOT_AVATARS.get(user.id)
@@ -3647,11 +3652,20 @@ async def fakescreenshot_cmd(
     if not body:
         await interaction.response.send_message("Type the message.", ephemeral=True)
         return
-    label = getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name
-    label = " ".join(str(label).split())[:256] or user.name
-    embed = discord.Embed(description=body[:4096], color=0x2B2D31, timestamp=discord.utils.utcnow())
-    embed.set_author(name=label, icon_url=user.display_avatar.replace(format="png", size=128).url)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo("America/New_York"))
+    hour = now.strftime("%I").lstrip("0") or "12"
+    stamp = f"{hour}:{now.minute:02d} {now.strftime('%p')}"
+    try:
+        png = await _fake_screenshot(user, body, stamp, "")
+    except Exception as exc:
+        _log(f"[screenshot] {exc}")
+        await interaction.followup.send("Couldn't make that message.", ephemeral=True)
+        return
+    await interaction.followup.send(file=discord.File(_io.BytesIO(png), filename="message.png"), ephemeral=True)
 
 
 @tree.command(name="fakeip", description="Show a fake network lookup. Only you see the person picker.")
