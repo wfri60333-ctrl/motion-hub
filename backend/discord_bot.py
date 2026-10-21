@@ -3633,7 +3633,7 @@ async def _fake_screenshot(user: discord.abc.User, text: str, when: str, period:
     return out.getvalue()
 
 
-@tree.command(name="fakescreenshot", description="Discord posts a message that looks like it is from that person. It shows up in your DMs.")
+@tree.command(name="fakescreenshot", description="Send a message that looks like that person. Only you can see it.")
 @app_commands.describe(
     user="The person the message looks like it is from.",
     text="What the message says. Type \\n for a new line.",
@@ -3647,77 +3647,11 @@ async def fakescreenshot_cmd(
     if not body:
         await interaction.response.send_message("Type the message.", ephemeral=True)
         return
-    channel = interaction.channel
-    parent = channel.parent if isinstance(channel, discord.Thread) else channel
-    if interaction.guild is None or not isinstance(parent, discord.TextChannel):
-        await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    me = interaction.guild.me or interaction.guild.get_member(client.user.id)
-    if me is None:
-        try:
-            me = await interaction.guild.fetch_member(client.user.id)
-        except Exception:
-            me = None
-    perms = parent.permissions_for(me) if me is not None else None
-    missing = []
-    if perms is None or not perms.manage_webhooks:
-        missing.append("Manage Webhooks")
-    if perms is None or not perms.create_private_threads:
-        missing.append("Create Private Threads")
-    if missing:
-        await interaction.followup.send(
-            "The bot needs " + " and ".join(missing) + " in this channel. Discord has to post the message. I can't draw it.",
-            ephemeral=True,
-        )
-        return
     label = getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name
-    label = " ".join(str(label).split())[:80] or user.name
-    avatar = str(user.display_avatar.replace(format="png", size=128).url)
-    thread = None
-    hook = None
-    try:
-        thread = await parent.create_thread(
-            name="message",
-            type=discord.ChannelType.private_thread,
-            auto_archive_duration=60,
-        )
-        hook = await parent.create_webhook(name="message")
-        sent = await hook.send(
-            body[:2000],
-            username=label,
-            avatar_url=avatar,
-            thread=thread,
-            wait=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        await interaction.user.send(
-            reference=discord.MessageReference(
-                message_id=sent.id,
-                channel_id=thread.id,
-                guild_id=interaction.guild.id,
-                type=discord.MessageReferenceType.forward,
-            )
-        )
-    except discord.Forbidden:
-        await interaction.followup.send("Open your DMs for this bot, then try again.", ephemeral=True)
-        return
-    except Exception as exc:
-        _log(f"[screenshot] {exc}")
-        await interaction.followup.send("Discord wouldn't post that message.", ephemeral=True)
-        return
-    finally:
-        if hook is not None:
-            try:
-                await hook.delete()
-            except Exception:
-                pass
-        if thread is not None:
-            try:
-                await thread.delete()
-            except Exception:
-                pass
-    await interaction.followup.send("Check your DMs. Discord made the message.", ephemeral=True)
+    label = " ".join(str(label).split())[:256] or user.name
+    embed = discord.Embed(description=body[:4096], color=0x2B2D31, timestamp=discord.utils.utcnow())
+    embed.set_author(name=label, icon_url=user.display_avatar.replace(format="png", size=128).url)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="fakeip", description="Show a fake network lookup. Only you see the person picker.")
